@@ -18,6 +18,7 @@ import {
   PictureOutlined,
   VideoCameraOutlined,
   AudioOutlined,
+  SoundOutlined,
   GlobalOutlined,
   ReloadOutlined,
   CloseOutlined,
@@ -78,6 +79,7 @@ const VLM_PROTOCOLS = [
   "自定义",
 ];
 const ASR_PROTOCOLS = ["DashScope Fun-ASR", "OpenAI Whisper"];
+const TTS_PROTOCOLS = ["DashScope（百炼）"];
 const IMAGE_PROTOCOLS = ["OpenAI 协议", "DashScope（百炼）"];
 const VIDEO_PROTOCOLS = ["DashScope（百炼）", "Volcano Engine（火山引擎）"];
 
@@ -119,6 +121,28 @@ const ASR_PRESETS: Record<string, ProtocolPreset> = {
     models: ["whisper-1"],
   },
 };
+
+const TTS_PRESETS: Record<string, ProtocolPreset> = {
+  "DashScope（百炼）": {
+    base_url: "https://dashscope.aliyuncs.com/api/v1",
+    freeze_url: true,
+    models: ["qwen3-tts-flash", "qwen3-tts"],
+  },
+};
+
+// Voice-cloning synthesis runs on a dedicated model; cloned character voices
+// are only usable through it.
+const TTS_VC_MODELS = ["qwen3-tts-vc-2026-01-22"];
+
+const TTS_VOICES = [
+  "Cherry",
+  "Serena",
+  "Ethan",
+  "Chelsie",
+  "Dylan",
+  "Jada",
+  "Sunny",
+];
 
 const IMAGE_PRESETS: Record<string, ProtocolPreset> = {
   "DashScope（百炼）": {
@@ -167,7 +191,7 @@ const VIDEO_PRESETS: Record<string, ProtocolPreset> = {
   },
 };
 
-type ModelType = "llm" | "vlm" | "asr" | "image" | "video";
+type ModelType = "llm" | "vlm" | "asr" | "tts" | "image" | "video";
 type TabType = ModelType | "grounding";
 const DEFAULT_CONFIG: ModelConfigData = {
   llm: {
@@ -217,6 +241,16 @@ const DEFAULT_CONFIG: ModelConfigData = {
     provider: "fun-asr",
     language: "",
     reuse_llm_key: true,
+  },
+  tts: {
+    enabled: false,
+    model_name: "qwen3-tts-flash",
+    api_key: "",
+    base_url: "https://dashscope.aliyuncs.com/api/v1",
+    protocol: "DashScope（百炼）",
+    custom_protocol: "",
+    voice: "",
+    vc_model_name: "",
   },
   image: {
     enabled: false,
@@ -349,6 +383,16 @@ const CARD_META: {
     required: false,
   },
   {
+    type: "tts",
+    label: "TTS 语音合成模型",
+    icon: (
+      <SoundOutlined
+        style={{ color: "var(--color-text-tertiary)", fontSize: 16 }}
+      />
+    ),
+    required: false,
+  },
+  {
     type: "image",
     label: "图片生成模型",
     icon: (
@@ -439,6 +483,8 @@ export default function ModelConfigModal({ open, onClose }: Props) {
         merged.vlm.protocol = VLM_PROTOCOLS[0];
       if (!ASR_PROTOCOLS.includes(merged.asr.protocol))
         merged.asr.protocol = ASR_PROTOCOLS[0];
+      if (!TTS_PROTOCOLS.includes(merged.tts.protocol))
+        merged.tts.protocol = TTS_PROTOCOLS[0];
       if (!IMAGE_PROTOCOLS.includes(merged.image.protocol))
         merged.image.protocol = IMAGE_PROTOCOLS[0];
       if (!VIDEO_PROTOCOLS.includes(merged.video.protocol))
@@ -818,6 +864,7 @@ export default function ModelConfigModal({ open, onClose }: Props) {
         "vlm",
         "grounding",
         "asr",
+        "tts",
         "image",
         "video",
       ] as TabType[]) {
@@ -866,6 +913,8 @@ export default function ModelConfigModal({ open, onClose }: Props) {
       ? VLM_PROTOCOLS
       : type === "asr"
       ? ASR_PROTOCOLS
+      : type === "tts"
+      ? TTS_PROTOCOLS
       : type === "image"
       ? IMAGE_PROTOCOLS
       : VIDEO_PROTOCOLS;
@@ -890,6 +939,7 @@ export default function ModelConfigModal({ open, onClose }: Props) {
       };
     }
     if (type === "asr") return ASR_PRESETS[protocol] || null;
+    if (type === "tts") return TTS_PRESETS[protocol] || null;
     if (type === "image") return IMAGE_PRESETS[protocol] || null;
     if (type === "video") return VIDEO_PRESETS[protocol] || null;
     return null;
@@ -1073,6 +1123,46 @@ export default function ModelConfigModal({ open, onClose }: Props) {
               value={config.asr.language}
               onChange={(e) => updateItem("asr", "language", e.target.value)}
             />
+          </div>
+        )}
+        {type === "tts" && (
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: "1fr 1fr",
+              gap: "0 16px",
+            }}
+          >
+            <div>
+              <label className="field-label">默认旁白音色</label>
+              <AutoComplete
+                value={config.tts.voice}
+                onChange={(v) => updateItem("tts", "voice", v)}
+                options={TTS_VOICES.map((v) => ({ value: v, label: v }))}
+                placeholder="如 Cherry"
+              />
+            </div>
+            <div>
+              <label className="field-label">声音复刻模型（可选）</label>
+              <AutoComplete
+                value={config.tts.vc_model_name}
+                onChange={(v) => updateItem("tts", "vc_model_name", v)}
+                options={TTS_VC_MODELS.map((v) => ({ value: v, label: v }))}
+                placeholder="留空使用默认复刻模型"
+              />
+            </div>
+            <p
+              style={{
+                gridColumn: "1 / -1",
+                margin: "2px 0 0",
+                fontSize: 11,
+                lineHeight: 1.6,
+                color: "var(--color-text-tertiary)",
+              }}
+            >
+              开启后可为成片生成旁白，并为角色复刻专属音色；默认音色用于旁白，
+              角色已绑定的复刻音色优先生效。
+            </p>
           </div>
         )}
         <div style={{ display: "flex", alignItems: "center", gap: 12 }}>

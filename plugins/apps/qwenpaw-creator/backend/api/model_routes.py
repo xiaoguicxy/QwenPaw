@@ -89,7 +89,16 @@ router = APIRouter(
 )
 
 
-_SECTIONS = ("llm", "vlm", "grounding", "asr", "image", "video", "oss")
+_SECTIONS = (
+    "llm",
+    "vlm",
+    "grounding",
+    "asr",
+    "tts",
+    "image",
+    "video",
+    "oss",
+)
 _ENV_MAPPING: dict[str, dict[str, tuple[str, ...]]] = {
     "llm": {
         "base_url": ("TEXT_BASE_URL",),
@@ -136,6 +145,13 @@ _ENV_MAPPING: dict[str, dict[str, tuple[str, ...]]] = {
         "base_url": ("ASR_BASE_URL",),
         "api_key": ("ASR_API_KEY",),
         "model_name": ("ASR_MODEL_NAME",),
+    },
+    "tts": {
+        "base_url": ("TTS_BASE_URL",),
+        "api_key": ("TTS_API_KEY",),
+        "model_name": ("TTS_MODEL_NAME",),
+        "voice": ("TTS_VOICE",),
+        "vc_model_name": ("TTS_VC_MODEL_NAME",),
     },
     "image": {
         "base_url": (
@@ -1095,6 +1111,10 @@ def _probe_payload(
         )
         if provider == "whisper":
             return _openai_model_probe(body, headers)
+        return _dashscope_policy_probe(body, headers)
+    if body.type == "tts":
+        # Synthesis is billed per character, so probe the model binding
+        # instead of generating audio.
         return _dashscope_policy_probe(body, headers)
     if body.type in {"llm", "vlm"}:
         content: Any = "Reply with pong only."
