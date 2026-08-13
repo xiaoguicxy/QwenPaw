@@ -296,7 +296,7 @@ _COLOR_GRADE_FILTERS: dict[str, str] = {
     # 电影感：压暗部、轻微去饱和。
     "cinematic": (
         "eq=brightness=-0.01:saturation=0.96:contrast=1.08:gamma=0.98,"
-        "colorbalance=sm=-0.03:bh=-0.02"
+        "colorbalance=bm=-0.03:bh=-0.02"
     ),
 }
 

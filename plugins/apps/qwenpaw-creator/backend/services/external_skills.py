@@ -38,7 +38,7 @@ from utils.logger import setup_logger
 
 logger = setup_logger("creator.external_skills")
 
-SKILL_CONTEXT_MAX_CHARS = 8000
+SKILL_CONTEXT_MAX_CHARS = 12000
 # Upper bound for one SKILL.md returned by the viewer tool.
 SKILL_FILE_READ_MAX_BYTES = 256 * 1024
 
@@ -289,11 +289,16 @@ def _clear_load_cache() -> None:
 # ── System prompt context ────────────────────────────────────────────────────
 
 
+_SKILL_DESCRIPTION_MAX_CHARS = 80
+
+
 def _skill_context_block(skill: LoadedSkill) -> str:
     parsed = parse_skill_md(skill.skill_md)
     description = (
         skill.entry.description or parsed["description"] or "（无描述）"
     ).strip()
+    if len(description) > _SKILL_DESCRIPTION_MAX_CHARS:
+        description = description[: _SKILL_DESCRIPTION_MAX_CHARS - 3] + "..."
     return (
         "<skill>\n"
         f"<name>{skill.entry.name}</name>\n"
