@@ -195,6 +195,39 @@ def test_builtin_skill_loads_and_config_can_shadow(
     assert "edu-math-tutorial" not in names
 
 
+def test_all_builtin_skills_parse_and_fit_catalog(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """Every shipped skill must load cleanly and fit the prompt budget.
+
+    Guards against malformed SKILL.md files silently degrading to
+    unavailable placeholders in production: a broken builtin skill would
+    otherwise vanish from the catalog without any test noticing.
+    """
+
+    _configure(tmp_path, monkeypatch, [])
+    monkeypatch.setattr(
+        external_skills,
+        "_BUILTIN_SKILLS_ROOT",
+        _REAL_BUILTIN_ROOT,
+    )
+    external_skills._clear_load_cache()
+    skills = load_skills()
+    assert skills, "the builtin skills root shipped at least one skill"
+    for skill in skills:
+        assert skill.available, f"{skill.entry.name}: {skill.reason}"
+        parsed = parse_skill_md(skill.skill_md)
+        assert parsed["name"] == skill.entry.name
+        assert parsed["name"] == skill.root.name
+        assert parsed["description"], f"{skill.entry.name}: no description"
+        assert parsed["body"], f"{skill.entry.name}: empty body"
+    context = render_external_skills_context(skills)
+    assert 0 < len(context) <= SKILL_CONTEXT_MAX_CHARS
+    for skill in skills:
+        assert f"<name>{skill.entry.name}</name>" in context
+
+
 # ── Catalog, viewer and manifests ────────────────────────────────────────────
 
 

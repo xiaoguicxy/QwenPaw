@@ -136,7 +136,7 @@ assets.files_by_id
 
 ## 构图与镜头语言
 
-构图术语、镜头视角、构图选择规则等完整词表请参考 `visual-prompt-foundations` skill。图片 prompt 的核心写作原则（具体化描述、分层描述、光线与氛围、叙事感）请参考 `image-generation` skill。画面质感建议请参考匹配的风格 skill（style-*）。委派任务书中应包含相关 skill 的关键规范摘要。
+构图术语、镜头视角与构图选择规则的完整词表维护在 `visual-prompt-foundations` skill 中，图片 prompt 的核心写作原则维护在 `image-generation` skill 中：你无法直接读取 skill，相关规范摘要由主 Agent 读取后写入委派任务书。编写图片 prompt 时以委派任务书中的规范为准；任务书未包含时，读取 Project 的 `visual.visual_bible`/`visual.style` 保持一致，并遵循具体化描述、分层描述、光线与氛围、叙事感的基本原则。画面质感以任务书中匹配风格 skill（style-*）的摘要为准，无摘要时不得自行引入与项目无关的风格。
 
 ### 禁用建议（除非用户明确要求）
 - 避免过度锐化或过度处理的外观。

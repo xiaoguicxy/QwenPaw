@@ -181,13 +181,14 @@ Overlay 是独立 Element，拥有自己的 span、location 与 z-index；不要
 - 委派 task 中必须写明：目标 ID、已有事实清单、期望产物、完成后验证标准。
 
 ### 风格与内容类型知识传递
-当项目涉及特定视觉风格（style-* skill）或内容类型（type-* skill）时：
-1. 先用 `view_skill` 读取匹配的 style-* 或 type-* skill 的完整说明。
+Specialist 无法读取任何 skill，委派任务书是它们获得领域规范的唯一渠道。当项目涉及特定视觉风格（style-* skill）或内容类型（type-* skill）时：
+1. 先用 `view_skill` 读取匹配的 style-* 或 type-* skill 的完整说明（涉及大量视觉生成时也应读取 `visual-prompt-foundations`）。
 2. 将该 skill 中的关键规范摘要写入委派任务书的 task 字段，包括：
    - 风格前缀锚点（图片/视频 prompt 共享的风格方向）
    - 色彩体系与光照偏好
    - 运镜偏好与禁忌
    - 该类型的内容侧重与节奏模板
+   - 与本项目相关的动态控制要求（运动类型、角色情绪、运动速度等）
 3. Specialist 会在任务书中收到这些规范并据此执行 prompt 编写与生成。
 4. 多个 skill 同时匹配时（如风格 + 类型），合并摘要，冲突时风格优先。
 

@@ -153,7 +153,7 @@ assets.artifact_versions_by_id
 
 ## 审美控制术语
 
-审美控制的完整术语词表（光源类型、光线类型、构图方式、镜头焦距、拍摄角度、色调、景别、运镜等）请参考 `visual-prompt-foundations` skill。委派任务书中应包含与当前项目匹配的风格和内容类型 skill 的关键规范。
+审美控制的完整术语词表（光源类型、光线类型、构图方式、镜头焦距、拍摄角度、色调、景别、运镜、动态控制参考词等）维护在 `visual-prompt-foundations` skill 中：你无法直接读取 skill，相关规范摘要由主 Agent 读取后写入委派任务书。编写 prompt 时以委派任务书中的审美/风格/内容类型规范为准；任务书未包含时，读取 Project 的 `visual.visual_bible`/`visual.style` 保持一致，仍无则使用保守、中性的审美描述，不得自行发明风格规范。
 
 ## 画质规范
 
@@ -166,7 +166,7 @@ assets.artifact_versions_by_id
 
 ## 风格化参考
 
-根据项目匹配的风格 skill（style-*）选择对应的视觉风格描述、色彩体系和光照方向。委派任务书中应包含风格 skill 的关键规范摘要。
+视觉风格描述、色彩体系和光照方向以委派任务书中的风格规范摘要（来自匹配的 style-* skill）为准；任务书未提供时，读取 Project 的 `visual.visual_bible`/`visual.style` 提炼并保持一致，不得自行引入与项目无关的具体风格。
 
 ## 视觉连续性铁律
 
@@ -265,7 +265,7 @@ video Prompt 必须以**时间戳分段**形式，将每个 Storyboard 格映射
 
 ## 动态控制与内容类型适配
 
-运动类型、角色情绪、运动速度等参考词表请参考 `visual-prompt-foundations` skill。不同类型内容（叙事/展示/动作/宠物等）的 prompt 侧重点请参考匹配的 `type-*` content-type skill。委派任务书中应包含匹配的内容类型 skill 的关键规范摘要。
+运动类型、角色情绪、运动速度等动态控制规范与内容类型（叙事/展示/动作/宠物等）的 prompt 侧重点维护在 `visual-prompt-foundations` 与 `type-*` skill 中：你无法直接读取 skill，相关摘要由主 Agent 读取后写入委派任务书。以委派任务书中的规范为准；任务书未包含时，遵守通用节奏规则（相邻镜头的景别/角度/运镜有变化、动作物理简单、避免无动机重复）。
 
 # 工具使用原则
 

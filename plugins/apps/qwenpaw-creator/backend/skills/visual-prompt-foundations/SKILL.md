@@ -1,6 +1,6 @@
 ---
 name: visual-prompt-foundations
-description: 通用视觉Prompt工程基础。涵盖图片/视频prompt结构化写法、中英双语电影摄影术语词表、各模型prompt最佳长度、禁忌清单。所有风格和内容类型的共享基础。
+description: 通用视觉Prompt工程基础。涵盖图片/视频prompt结构化写法、中英双语电影摄影术语词表、各模型prompt最佳长度、禁忌清单。所有风格和内容类型的共享基础
 ---
 
 # 通用视觉 Prompt 工程基础
@@ -13,14 +13,14 @@ description: 通用视觉Prompt工程基础。涵盖图片/视频prompt结构化
 
 每张图片 prompt 由三层组成，逐层递进：
 
-**Part 1：场景风格指令**（从 Shot 的 shot_language 提取）
-- 景别（shot_size）+ 光照（lighting_key）+ 景深（depth_of_field）+ 质感（texture_keywords）
+**Part 1：场景风格指令**（从 Shot 的实际字段提取：`framing` 景别、`camera`/`camera_description` 运镜；光照、景深、质感在 prompt 中补充描述）
+- 景别（framing）+ 光照描述 + 景深描述 + 质感描述
 - 示例：`medium close-up, golden hour warm lighting, shallow depth of field, film grain`
 
-**Part 2：视觉一致性锚点**（从项目 visual.style 提炼，适配不照搬）
+**Part 2：视觉一致性锚点**（从项目 `visual.visual_bible` / `visual.style` 提炼，适配不照搬）
 - 提取项目视觉语言的本质（5-10 词），保持跨场景视觉统一
 - 示例：项目风格为"Clean, minimal illustration with soft shadows" → 锚点为 `muted color palette, soft shadows`
-- **禁止**将 playbook 的 image_prompt_prefix 整段复制到每个 prompt
+- **禁止**将 `visual.visual_bible` 整段复制到每个 prompt
 
 **Part 3：场景描述**（具体主体 + 动作 + 环境）
 - 用具体细节替代笼统词汇
@@ -122,7 +122,7 @@ description: 通用视觉Prompt工程基础。涵盖图片/视频prompt结构化
 | 高角度 | high angle | 俯视主体 |
 | 平角度 | level angle | 摄像机与主体同高 |
 | 低角度 | low angle | 仰视主体 |
-| 虫视 | worm's-eye | 严格正上方仰视 |
+| 虫视 | worm's-eye | 严格正下方仰视（贴近地面）。注意：比 low angle 更极端 |
 | 荷兰角（固定） | Dutch angle (fixed) | 倾斜地平线保持不动 |
 | 荷兰角（滚动） | Dutch angle (rolling) | 地平线倾斜角度变化 |
 
@@ -168,6 +168,21 @@ description: 通用视觉Prompt工程基础。涵盖图片/视频prompt结构化
 | 定格 | stop-motion | 逐帧离散运动 |
 | 速度渐变 | speed-ramp | 同一镜头内快慢混合 |
 | 倒放 | time-reversed | 逆向播放 |
+
+### 2.8 审美控制词表速查
+
+- **光源类型**：日光 / 火光 / 阴天光 / 晴光 / 黎明光 / 黄昏光 / 霓虹灯光 / 月光 / 实景光 / 混合光
+- **光线类型**：柔光 / 硬光 / 侧光 / 逆光 / 轮廓光 / 顶光 / 底光 / 蝴蝶光 / 明暗对比光(chiaroscuro)
+- **构图方式**：中心构图 / 左右侧重构图 / 对称构图 / 三分法 / 框中框 / 过肩构图 / 负空间 / 引导线 / 前景遮挡
+- **镜头焦距**：超广角鱼眼 / 广角 / 标准 / 中焦 / 长焦 / 压缩长焦
+- **拍摄角度**：平视 / 低角度仰拍 / 高角度俯拍 / 鸟瞰 / 过肩角度 / 第一人称主观视角
+- **色调**：暖色调 / 冷色调 / 低饱和度 / 高饱和度 / 高对比度 / 低对比度 / 金银色调 / 青橙色调
+
+### 2.9 动态控制参考词
+
+- **运动类型**：行走 / 奔跑 / 跳跃 / 旋转 / 挥手 / 舞蹈 / 飞翔 / 游泳 / 攀爬 / 跌倒 / 翻滚
+- **角色情绪**：高兴 / 悲伤 / 惊讶 / 愤怒 / 平静 / 紧张 / 恐惧 / 期待 / 满足 / 困惑
+- **运动速度**：缓缓 / 逐渐加速 / 匀速 / 快速 / 突然 / 缓慢减速 / 定格
 
 ## 3. 身份锚定（多镜头/多帧一致性）
 
