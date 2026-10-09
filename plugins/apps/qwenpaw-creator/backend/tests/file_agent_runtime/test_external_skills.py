@@ -95,7 +95,9 @@ def test_broken_entries_stay_isolated(tmp_path, monkeypatch) -> None:
     assert loaded["good"].available
     assert not loaded["ghost"].available and loaded["ghost"].reason
     assert not loaded["bad-md"].available
-    assert "off" not in loaded  # disabled entries are skipped entirely
+    # Disabled entries stay listed (enabled=False) so the UI can re-enable
+    # them; agent-facing consumers filter on entry.enabled.
+    assert "off" in loaded and not loaded["off"].entry.enabled
     invalid = next(s for s in loaded.values() if "invalid" in (s.reason or ""))
     assert not invalid.available
 

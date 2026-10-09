@@ -251,7 +251,9 @@ def load_skills() -> list[LoadedSkill]:
     try:
         config_entries = load_skills_config()
         configured_names = {entry.name for entry in config_entries}
-        entries = [item for item in config_entries if item.enabled]
+        # Disabled user skills stay listed so the UI can show and re-enable
+        # them; agent-facing consumers filter on entry.enabled themselves.
+        entries = list(config_entries)
         entries.extend(_builtin_entries(configured_names))
         issues = load_skills_config_issues()
         signature = (
@@ -333,7 +335,11 @@ def render_external_skills_context(
     try:
         if skills is None:
             skills = load_skills()
-        available = [skill for skill in skills if skill.available]
+        available = [
+            skill
+            for skill in skills
+            if skill.available and skill.entry.enabled
+        ]
         if not available:
             return ""
         parts = [_CONTEXT_HEADER]
@@ -445,7 +451,11 @@ def external_skill_tool_manifests(
 ) -> list[dict[str, Any]]:
     """Tool manifests for the main Agent when any skill is available."""
 
-    names = sorted(skill.entry.name for skill in skills if skill.available)
+    names = sorted(
+        skill.entry.name
+        for skill in skills
+        if skill.available and skill.entry.enabled
+    )
     if not names:
         return []
     skill_property = {
