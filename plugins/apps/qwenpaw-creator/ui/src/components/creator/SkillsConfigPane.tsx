@@ -1,0 +1,511 @@
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type ChangeEvent,
+} from "react";
+import { useTranslation } from "react-i18next";
+import { Button, Dropdown, Input, Modal, Switch, Tooltip, message } from "antd";
+import { Eye, Pencil, Plus, Trash2, Upload } from "lucide-react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import {
+  deleteSkill,
+  getSkillContent,
+  listSkills,
+  saveSkill,
+  setSkillEnabled,
+  uploadSkillZip,
+  type SkillItem,
+} from "@/api/creator";
+
+const SKILL_TEMPLATE = `---
+name: my-video-skill
+description: |
+  一句话说明适用场景与产出，例如“美食短视频的开场钩子与镜头节奏模板”。
+---
+
+# 技能标题
+
+## 适用场景
+Agent 在什么情况下应参考本技能（例如：编排某类短视频分镜时）。
+
+## 知识要点
+- 开场 3 秒如何留住观众。
+- 镜头节奏、转场与单镜时长控制。
+- 文案/字幕的语气与版式规范。
+
+## 产出规范
+遵循本技能后，Agent 应产出什么样的结果。
+`;
+
+/** First sentence of a skill description, for a compact list preview. */
+function briefDescription(description: string | null): string {
+  const text = (description || "").replace(/\s+/g, " ").trim();
+  return text.split("。")[0];
+}
+
+/** Drop the leading YAML front matter so only the body gets rendered. */
+function stripFrontmatter(text: string): string {
+  const match = /^---\r?\n[\s\S]*?\r?\n---\r?\n?/.exec(text);
+  return match ? text.slice(match[0].length) : text;
+}
+
+/** Skill names are filesystem identifiers — a lowercase slug (matches backend). */
+const SKILL_NAME_RE = /^[a-z0-9][a-z0-9._-]*$/;
+
+export default function SkillsConfigPane() {
+  const { t } = useTranslation();
+  const [items, setItems] = useState<SkillItem[]>([]);
+  const [editorOpen, setEditorOpen] = useState(false);
+  const [editingName, setEditingName] = useState("");
+  const [name, setName] = useState("");
+  const [content, setContent] = useState(SKILL_TEMPLATE);
+  const [saving, setSaving] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const [previewMode, setPreviewMode] = useState(false);
+  const [showPreview, setShowPreview] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const refresh = useCallback(async () => {
+    try {
+      const res = await listSkills();
+      setItems(res.items);
+    } catch (error) {
+      message.error(
+        error instanceof Error ? error.message : t("skills.loadFailed"),
+      );
+    }
+  }, [t]);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  const openCreate = () => {
+    setPreviewMode(false);
+    setShowPreview(false);
+    setEditingName("");
+    setName("");
+    setContent(SKILL_TEMPLATE);
+    setEditorOpen(true);
+  };
+
+  const openEdit = async (item: SkillItem) => {
+    setPreviewMode(false);
+    setShowPreview(false);
+    setEditingName(item.name);
+    setName(item.name);
+    try {
+      const res = await getSkillContent(item.name);
+      setContent(res.content);
+    } catch {
+      setContent(SKILL_TEMPLATE);
+    }
+    setEditorOpen(true);
+  };
+
+  const openPreview = async (item: SkillItem) => {
+    setPreviewMode(true);
+    setShowPreview(true);
+    setEditingName(item.name);
+    setName(item.name);
+    try {
+      const res = await getSkillContent(item.name);
+      setContent(res.content);
+    } catch {
+      setContent("");
+    }
+    setEditorOpen(true);
+  };
+
+  const handleSave = async () => {
+    const skillName = name.trim();
+    if (!skillName) {
+      message.error(t("skills.nameRequired"));
+      return;
+    }
+    if (!SKILL_NAME_RE.test(skillName)) {
+      message.error(t("skills.nameInvalid"));
+      return;
+    }
+    setSaving(true);
+    try {
+      await saveSkill(skillName, content);
+      message.success(t("skills.saveSuccess"));
+      setEditorOpen(false);
+      await refresh();
+    } catch (error) {
+      message.error(
+        error instanceof Error ? error.message : t("skills.saveFailed"),
+      );
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleToggle = async (item: SkillItem, enabled: boolean) => {
+    try {
+      await setSkillEnabled(item.name, enabled);
+      await refresh();
+    } catch (error) {
+      message.error(
+        error instanceof Error ? error.message : t("skills.saveFailed"),
+      );
+    }
+  };
+
+  const handleDelete = (item: SkillItem) => {
+    Modal.confirm({
+      title: t("skills.deleteConfirmTitle"),
+      content: item.name,
+      okText: t("common.delete"),
+      cancelText: t("common.cancel"),
+      okButtonProps: { danger: true },
+      onOk: async () => {
+        try {
+          await deleteSkill(item.name);
+          await refresh();
+        } catch (error) {
+          message.error(
+            error instanceof Error ? error.message : t("skills.saveFailed"),
+          );
+        }
+      },
+    });
+  };
+
+  const handleUploadZip = () => fileInputRef.current?.click();
+
+  const handleFileChange = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    event.target.value = "";
+    if (!file.name.toLowerCase().endsWith(".zip")) {
+      message.warning(t("skills.zipOnly"));
+      return;
+    }
+    setUploading(true);
+    try {
+      const res = await uploadSkillZip(file);
+      if (res.count > 0) {
+        message.success(
+          `${t("skills.uploadSuccess")}: ${res.imported.join(", ")}`,
+        );
+      } else {
+        message.warning(t("skills.uploadNoSkill"));
+      }
+      if (res.skipped.length > 0) {
+        const names = res.skipped.map((entry) => entry.name).join(", ");
+        message.warning(`${t("skills.uploadSkipped")}: ${names}`);
+      }
+      await refresh();
+    } catch (error) {
+      message.error(
+        error instanceof Error ? error.message : t("skills.uploadFailed"),
+      );
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  const nameInvalid =
+    !editingName && name.trim().length > 0 && !SKILL_NAME_RE.test(name.trim());
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+      <div style={{ display: "flex", alignItems: "flex-start", gap: 8 }}>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div
+            style={{
+              fontSize: 15,
+              fontWeight: 700,
+              color: "var(--color-text-primary)",
+            }}
+          >
+            {t("modelConfig.paneSkills")}
+          </div>
+          <div
+            style={{
+              fontSize: 12,
+              color: "var(--color-text-tertiary)",
+              marginTop: 3,
+              lineHeight: 1.6,
+            }}
+          >
+            {t("modelConfig.paneSkillsDesc")}
+          </div>
+        </div>
+        <Dropdown
+          trigger={["click"]}
+          menu={{
+            items: [
+              {
+                key: "create",
+                label: t("skills.newSkill"),
+                icon: <Plus size={14} />,
+                onClick: openCreate,
+              },
+              {
+                key: "upload",
+                label: t("skills.uploadZip"),
+                icon: <Upload size={14} />,
+                onClick: handleUploadZip,
+              },
+            ],
+          }}
+        >
+          <Button icon={<Plus size={14} />} loading={uploading}>
+            {t("skills.add")}
+          </Button>
+        </Dropdown>
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept=".zip"
+          style={{ display: "none" }}
+          onChange={handleFileChange}
+        />
+      </div>
+
+      <div
+        style={{
+          borderLeft: "3px solid var(--color-accent)",
+          background: "var(--color-bg-layout)",
+          borderRadius: "0 8px 8px 0",
+          padding: "7px 12px",
+          fontSize: 11.5,
+          lineHeight: 1.6,
+          color: "var(--color-text-secondary)",
+        }}
+      >
+        {t("skills.paneHint")}
+      </div>
+
+      {items.length === 0 && (
+        <div
+          style={{
+            fontSize: 12,
+            color: "var(--color-text-tertiary)",
+            padding: "12px 0",
+          }}
+        >
+          {t("skills.empty")}
+        </div>
+      )}
+
+      {items.map((item) => (
+        <div
+          key={item.name}
+          style={{
+            border: "1px solid var(--color-border)",
+            borderRadius: 10,
+            padding: "10px 12px",
+            display: "flex",
+            alignItems: "center",
+            gap: 10,
+          }}
+        >
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div
+              style={{
+                fontSize: 13,
+                fontWeight: 600,
+                display: "flex",
+                alignItems: "center",
+                gap: 6,
+              }}
+            >
+              <span>{item.name}</span>
+              {item.builtin && (
+                <span
+                  style={{
+                    fontSize: 10,
+                    fontWeight: 500,
+                    color: "var(--color-text-tertiary)",
+                    border: "1px solid var(--color-border)",
+                    borderRadius: 6,
+                    padding: "0 5px",
+                  }}
+                >
+                  {t("skills.builtin")}
+                </span>
+              )}
+              {item.status === "unavailable" && (
+                <Tooltip title={item.reason}>
+                  <span
+                    style={{
+                      fontSize: 10,
+                      fontWeight: 500,
+                      color: "var(--color-warning)",
+                    }}
+                  >
+                    {t("skills.unavailable")}
+                  </span>
+                </Tooltip>
+              )}
+            </div>
+            <div
+              style={{
+                fontSize: 11.5,
+                color: "var(--color-text-secondary)",
+                marginTop: 2,
+                overflow: "hidden",
+                display: "-webkit-box",
+                WebkitLineClamp: 1,
+                WebkitBoxOrient: "vertical" as const,
+              }}
+            >
+              {briefDescription(item.description) || t("skills.noDescription")}
+            </div>
+          </div>
+          <Switch
+            size="small"
+            checked={item.enabled}
+            disabled={item.builtin}
+            onChange={(checked) => handleToggle(item, checked)}
+          />
+          <Button
+            size="small"
+            type="text"
+            aria-label={t("skills.preview")}
+            icon={<Eye size={14} />}
+            onClick={() => openPreview(item)}
+          />
+          {!item.builtin && (
+            <>
+              <Button
+                size="small"
+                type="text"
+                aria-label={t("skills.edit")}
+                icon={<Pencil size={14} />}
+                onClick={() => openEdit(item)}
+              />
+              <Button
+                size="small"
+                type="text"
+                danger
+                aria-label={t("common.delete")}
+                icon={<Trash2 size={14} />}
+                onClick={() => handleDelete(item)}
+              />
+            </>
+          )}
+        </div>
+      ))}
+
+      <Modal
+        open={editorOpen}
+        title={
+          previewMode
+            ? `${t("skills.preview")} · ${editingName}`
+            : editingName
+            ? t("skills.edit")
+            : t("skills.newSkill")
+        }
+        okText={t("common.save")}
+        cancelText={previewMode ? t("common.close") : t("common.cancel")}
+        okButtonProps={{
+          style: previewMode ? { display: "none" } : undefined,
+        }}
+        confirmLoading={saving}
+        onOk={handleSave}
+        onCancel={() => setEditorOpen(false)}
+        width={720}
+      >
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          {!previewMode && (
+            <div>
+              <label className="field-label">{t("skills.name")}</label>
+              <Input
+                value={name}
+                disabled={!!editingName}
+                status={nameInvalid ? "error" : undefined}
+                placeholder="my-video-editing-skill"
+                onChange={(event) => setName(event.target.value)}
+              />
+              {!editingName && (
+                <div
+                  style={{
+                    fontSize: 11,
+                    marginTop: 4,
+                    lineHeight: 1.5,
+                    color: nameInvalid
+                      ? "var(--color-error)"
+                      : "var(--color-text-tertiary)",
+                  }}
+                >
+                  {nameInvalid ? t("skills.nameInvalid") : t("skills.nameRule")}
+                </div>
+              )}
+            </div>
+          )}
+          <div>
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                marginBottom: 4,
+              }}
+            >
+              <label className="field-label">{t("skills.content")}</label>
+              <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                <span
+                  style={{
+                    fontSize: 12,
+                    color: "var(--color-text-tertiary)",
+                  }}
+                >
+                  {t("skills.preview")}
+                </span>
+                <Switch
+                  size="small"
+                  checked={showPreview}
+                  onChange={setShowPreview}
+                />
+              </div>
+            </div>
+            {showPreview ? (
+              <div
+                style={{
+                  border: "1px solid var(--color-border)",
+                  borderRadius: 8,
+                  padding: "12px 16px",
+                  height: 360,
+                  overflow: "auto",
+                  background: "var(--color-bg-layout)",
+                  fontSize: 13,
+                  lineHeight: 1.7,
+                }}
+              >
+                <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                  {stripFrontmatter(content)}
+                </ReactMarkdown>
+              </div>
+            ) : (
+              <Input.TextArea
+                rows={16}
+                value={content}
+                readOnly={previewMode}
+                onChange={(event) => setContent(event.target.value)}
+              />
+            )}
+          </div>
+          {!previewMode && (
+            <div
+              style={{
+                fontSize: 11,
+                color: "var(--color-text-tertiary)",
+                lineHeight: 1.6,
+              }}
+            >
+              {t("skills.editorHint")}
+            </div>
+          )}
+        </div>
+      </Modal>
+    </div>
+  );
+}
