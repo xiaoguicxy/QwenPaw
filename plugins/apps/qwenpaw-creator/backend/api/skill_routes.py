@@ -104,7 +104,11 @@ class SaveSkillRequest(BaseModel):
 
 @router.post("")
 async def save_skill(request: SaveSkillRequest) -> dict[str, Any]:
-    entry = _data_root_guard(
+    # Every writer here takes the module-wide skills_config lock and does
+    # blocking disk IO, so none of it may run on the ASGI event loop: waiting
+    # for a lock held by a ZIP import worker would stall every other request.
+    entry = await asyncio.to_thread(
+        _data_root_guard,
         lambda: save_user_skill(request.name.strip(), request.content),
     )
     return {"ok": True, "name": entry.name}
@@ -144,7 +148,8 @@ async def toggle_skill(
     name: str,
     request: ToggleSkillRequest,
 ) -> dict[str, Any]:
-    changed = _data_root_guard(
+    changed = await asyncio.to_thread(
+        _data_root_guard,
         lambda: set_user_skill_enabled(name, request.enabled),
     )
     if not changed:
@@ -154,7 +159,10 @@ async def toggle_skill(
 
 @router.delete("/{name}")
 async def remove_skill(name: str) -> dict[str, Any]:
-    deleted = _data_root_guard(lambda: delete_user_skill(name))
+    deleted = await asyncio.to_thread(
+        _data_root_guard,
+        lambda: delete_user_skill(name),
+    )
     if not deleted:
         raise HTTPException(status_code=404, detail=f"技能不存在或为内置: {name}")
     return {"deleted": name}

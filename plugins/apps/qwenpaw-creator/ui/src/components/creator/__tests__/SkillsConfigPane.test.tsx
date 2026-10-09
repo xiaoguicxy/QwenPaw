@@ -13,8 +13,9 @@ import type { SkillContent, SkillItem } from "@/api/creator/skills";
 import zh from "@/locales/zh.json";
 
 // Controllable API mocks so a test can hold skill "alpha"'s save open while
-// the editor moves on to "beta" -- the race the save-completion seq guard
-// defends against.
+// the editor moves on to "beta" -- the state transition the save-completion
+// sequence guard defends against (see the note inside that test on why the
+// drive-through is synthetic rather than user-reachable).
 const { listSkillsMock, getSkillContentMock, saveSkillMock } = vi.hoisted(
   () => ({
     listSkillsMock: vi.fn(),
@@ -114,8 +115,10 @@ describe("SkillsConfigPane editor session guard", () => {
     expect(saveSkillMock).toHaveBeenCalledWith("alpha", "alpha original body");
 
     // While alpha's save is still in flight, move the editor to beta and make
-    // an unsaved edit. antd blocks Cancel during confirmLoading, so the test
-    // drives the row action directly to advance the edit session.
+    // an unsaved edit. antd 6.5.0 blocks every cancel/close path during
+    // confirmLoading and its mask covers the row actions, so this synthetic
+    // drive-through proves the session-sequence state machine only -- it is
+    // not a reproduction of a user-reachable flow.
     fireEvent.click(editButtons()[1]);
     await screen.findByDisplayValue("beta original body");
     fireEvent.change(screen.getByDisplayValue("beta original body"), {

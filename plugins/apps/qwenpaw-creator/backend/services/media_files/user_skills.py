@@ -17,7 +17,11 @@ import tempfile
 import threading
 from pathlib import Path
 
-from models.config import load_skills_config, write_skills_config
+from models.config import (
+    load_skills_config,
+    load_skills_config_issues,
+    write_skills_config,
+)
 from schemas.skills import SkillEntry
 from services.external_skills import (
     _BUILTIN_SKILLS_ROOT,
@@ -32,16 +36,44 @@ _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 # Skills are plain-text domain knowledge; 32 MiB is far beyond any real
 # SKILL.md bundle and stops accidental huge uploads before extraction.
 _MAX_ZIP_BYTES = 32 * 1024 * 1024
-# Serializes the read-modify-write of skills_config.json across the
-# asyncio.to_thread workers so concurrent save/toggle/delete/import cannot
-# lose each other's updates. Single-process only: a multi-process deployment
-# would need a cross-process lock, since atomic_replace_bytes guarantees a
-# whole-file swap but not a read-modify-write transaction.
+# Serializes the read-modify-write of skills_config.json for every writer
+# (route work dispatched through asyncio.to_thread, plus the ZIP import
+# worker) so concurrent save/toggle/delete/import cannot lose each other's
+# updates. Single-process mutual exclusion is the documented project-wide
+# topology (see services/runtime_files/locking.py): a multi-process
+# deployment would need a real advisory lock file, since atomic_replace_bytes
+# guarantees a whole-file swap but not a read-modify-write transaction.
+# CrossProcessFileLock is not that lock -- despite its name it is
+# process-local and never creates a file.
 _CONFIG_LOCK = threading.RLock()
 
 
 class UserSkillError(ValueError):
     """A user skill save/delete request that must be refused."""
+
+
+def _require_repairable_config() -> None:
+    """Refuse a full write-back while the document still holds bad entries.
+
+    ``load_skills_config`` deliberately returns only the validated subset, so
+    writing it back would delete every entry the tolerant reader preserved as
+    a diagnostic -- including ones unrelated to this request. Invalid rows
+    cannot be removed through the UI either (they never reach the valid
+    subset), so an ordinary toggle of another skill would be the only thing
+    that silently destroyed them.
+    """
+
+    issues = load_skills_config_issues()
+    if not issues:
+        return
+    names = ", ".join(str(issue.get("name") or "?") for issue in issues[:5])
+    detail = "；".join(
+        (
+            f"skills_config.json 存在被拒绝的条目（{names}）",
+            "为避免丢失无关配置已拒绝写入，请先修复该文件",
+        ),
+    )
+    raise UserSkillError(detail)
 
 
 def _skills_root() -> Path:
@@ -71,13 +103,22 @@ def save_user_skill(name: str, content: str) -> SkillEntry:
             f"SKILL.md 格式无效（需要 --- front matter --- 头部）：{exc}",
         ) from exc
     with _CONFIG_LOCK:
+        _require_repairable_config()
+        entries = list(load_skills_config())
+        existing = next((item for item in entries if item.name == name), None)
+        if existing is None and name in _builtin_skill_names():
+            # Overriding a builtin stays a deployment decision taken through
+            # an explicit skills_config.json entry; an ordinary create must
+            # not shadow one silently because the UI renders builtins as
+            # read-only and would then hide the original content.
+            raise UserSkillError(
+                f"技能名与内置技能同名，保存将覆盖内置内容: {name}",
+            )
         # Publish SKILL.md and register the entry in one critical section so
         # a concurrent delete cannot remove the directory in between and leave
         # a registered entry whose file is gone (resurrected as unavailable).
         directory.mkdir(parents=True, exist_ok=True)
         atomic_replace_bytes(directory / "SKILL.md", content.encode("utf-8"))
-        entries = list(load_skills_config())
-        existing = next((item for item in entries if item.name == name), None)
         if existing is not None:
             entry = existing.model_copy(update={"path": str(directory)})
             entries = [
@@ -179,7 +220,12 @@ def import_skills_from_zip_bytes(data: bytes) -> dict:
                     continue
                 save_user_skill(name, content)
                 imported.append(name)
-            except (UserSkillError, ValueError, OSError) as exc:
+            except Exception as exc:
+                # One bad member must never abort the batch: parse_skill_md
+                # re-raises PyYAML errors (ParserError/ScannerError) which are
+                # not ValueError subclasses, and a narrow tuple would let them
+                # escape as a 500 after some skills were already installed and
+                # before the rest were even looked at.
                 skipped.append({"name": label, "reason": str(exc)})
     return {"imported": imported, "skipped": skipped, "count": len(imported)}
 
@@ -188,6 +234,7 @@ def set_user_skill_enabled(name: str, enabled: bool) -> bool:
     """Toggle a configured (non-builtin) skill; report whether it changed."""
 
     with _CONFIG_LOCK:
+        _require_repairable_config()
         entries = list(load_skills_config())
         changed = False
         for index, item in enumerate(entries):
@@ -204,6 +251,7 @@ def delete_user_skill(name: str) -> bool:
     """Remove a configured skill entry and its managed directory."""
 
     with _CONFIG_LOCK:
+        _require_repairable_config()
         entries = list(load_skills_config())
         remaining = [item for item in entries if item.name != name]
         if len(remaining) == len(entries):

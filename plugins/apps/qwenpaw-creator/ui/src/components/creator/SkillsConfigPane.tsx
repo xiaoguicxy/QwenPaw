@@ -157,9 +157,12 @@ export default function SkillsConfigPane() {
       message.error(t("skills.nameInvalid"));
       return;
     }
-    // Capture the edit session: if the user closes this modal and opens
-    // another skill before this save resolves, the completion must not close
-    // that newer session and discard its unsaved edits.
+    // Defense-in-depth, not a reachable flow: antd 6.5.0 returns early from
+    // handleCancel while confirmLoading is set, so every cancel/close path is
+    // blocked and the mask also covers the row actions. The captured sequence
+    // still guards the state machine, so a later change that makes the modal
+    // dismissible mid-save cannot let a late completion close a newer session
+    // and discard its unsaved edits.
     const seq = editSeqRef.current;
     setSaving(true);
     try {
