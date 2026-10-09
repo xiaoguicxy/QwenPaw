@@ -70,10 +70,12 @@ def save_user_skill(name: str, content: str) -> SkillEntry:
         raise UserSkillError(
             f"SKILL.md 格式无效（需要 --- front matter --- 头部）：{exc}",
         ) from exc
-    directory.mkdir(parents=True, exist_ok=True)
-    atomic_replace_bytes(directory / "SKILL.md", content.encode("utf-8"))
-
     with _CONFIG_LOCK:
+        # Publish SKILL.md and register the entry in one critical section so
+        # a concurrent delete cannot remove the directory in between and leave
+        # a registered entry whose file is gone (resurrected as unavailable).
+        directory.mkdir(parents=True, exist_ok=True)
+        atomic_replace_bytes(directory / "SKILL.md", content.encode("utf-8"))
         entries = list(load_skills_config())
         existing = next((item for item in entries if item.name == name), None)
         if existing is not None:
