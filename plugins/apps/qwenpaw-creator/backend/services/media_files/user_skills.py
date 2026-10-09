@@ -11,6 +11,7 @@ and never grants a skill any capability beyond the SKILL.md text.
 """
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import tempfile
@@ -30,6 +31,9 @@ from services.external_skills import (
 )
 from services.runtime_files.atomic_store import atomic_replace_bytes
 from services.storage_root import require_creator_data_root
+from utils.logger import setup_logger
+
+logger = setup_logger("services.media_files.user_skills")
 
 _USER_SKILL_DIR_NAME = "skills"
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
@@ -46,10 +50,27 @@ _MAX_ZIP_BYTES = 32 * 1024 * 1024
 # CrossProcessFileLock is not that lock -- despite its name it is
 # process-local and never creates a file.
 _CONFIG_LOCK = threading.RLock()
+# Upper bound for one skipped-member reason: it travels to the client, and
+# parse/OS failures quote the offending path and payload back.
+_MAX_SKIP_REASON_CHARS = 400
 
 
 class UserSkillError(ValueError):
     """A user skill save/delete request that must be refused."""
+
+
+def _skills_config_path() -> Path:
+    """Where ``write_skills_config`` would persist the document.
+
+    Mirrors the writer instead of the reader: the reader falls back to a
+    read-only sentinel, while an explicit ``CREATOR_SKILLS_CONFIG_PATH``
+    still wins over the data root here.
+    """
+
+    configured = os.environ.get("CREATOR_SKILLS_CONFIG_PATH", "").strip()
+    if configured:
+        return Path(configured).expanduser().resolve(strict=False)
+    return require_creator_data_root() / "config" / "skills_config.json"
 
 
 def _require_repairable_config() -> None:
@@ -67,10 +88,18 @@ def _require_repairable_config() -> None:
     if not issues:
         return
     names = ", ".join(str(issue.get("name") or "?") for issue in issues[:5])
+    target = _skills_config_path()
+    logger.warning(
+        "user skill write refused: %d rejected entries in %s: %s",
+        len(issues),
+        target,
+        names,
+    )
     detail = "；".join(
         (
             f"skills_config.json 存在被拒绝的条目（{names}）",
-            "为避免丢失无关配置已拒绝写入，请先修复该文件",
+            "为避免丢失无关配置已拒绝写入",
+            f"请先修复 {target}",
         ),
     )
     raise UserSkillError(detail)
@@ -226,7 +255,20 @@ def import_skills_from_zip_bytes(data: bytes) -> dict:
                 # not ValueError subclasses, and a narrow tuple would let them
                 # escape as a 500 after some skills were already installed and
                 # before the rest were even looked at.
-                skipped.append({"name": label, "reason": str(exc)})
+                #
+                # A catch-all also hides our own defects, so keep the
+                # traceback on the server and bound what the client sees.
+                logger.warning(
+                    "skill zip member skipped: name=%s",
+                    label,
+                    exc_info=True,
+                )
+                skipped.append(
+                    {
+                        "name": label,
+                        "reason": str(exc)[:_MAX_SKIP_REASON_CHARS],
+                    },
+                )
     return {"imported": imported, "skipped": skipped, "count": len(imported)}
 
 

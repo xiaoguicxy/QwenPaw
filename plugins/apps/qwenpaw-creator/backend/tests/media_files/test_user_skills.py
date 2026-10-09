@@ -136,13 +136,22 @@ def test_same_name_save_and_delete_never_register_a_fileless_skill(
         target=lambda: deleted.append(user_skills.delete_user_skill("demo")),
     )
     saver.start()
-    assert in_write.wait(timeout=5.0), "save never reached the SKILL.md write"
-    deleter.start()
-    deleter.join(timeout=0.2)
-    assert not deleted, "delete completed while the save held the lock"
-    resume_write.set()
-    deleter.join(timeout=5.0)
-    saver.join(timeout=5.0)
+    try:
+        reached = in_write.wait(timeout=5.0)
+        assert reached, "save never reached the SKILL.md write"
+        deleter.start()
+        deleter.join(timeout=0.2)
+        assert not deleted, "delete completed while the save held the lock"
+    finally:
+        # Always release the parked writer. Without this a failed assert
+        # leaves the save thread waiting out its own timeout and the delete
+        # thread blocked on the lock, turning one red test into a slow,
+        # dirty teardown whose leftovers can pollute later cases.
+        resume_write.set()
+        saver.join(timeout=5.0)
+        deleter.join(timeout=5.0)
+    assert not saver.is_alive(), "save thread did not finish"
+    assert not deleter.is_alive(), "delete thread did not finish"
 
     registered = {item.name for item in config.load_skills_config()}
     if "demo" in registered:
@@ -181,8 +190,12 @@ def test_writes_refuse_to_drop_a_rejected_config_entry(
     config._clear_skills_config_cache()
     external_skills._clear_load_cache()
 
-    with pytest.raises(user_skills.UserSkillError):
+    with pytest.raises(user_skills.UserSkillError) as refused:
         user_skills.set_user_skill_enabled("demo", False)
+    # The refusal has to be actionable: the panel shows the rejected row as
+    # unavailable, and the toast must name both the row and the file to fix.
+    assert "legacy" in str(refused.value)
+    assert "skills_config.json" in str(refused.value)
     # The refused toggle left the valid entry untouched too.
     assert config.load_skills_config()[0].enabled is True
     document = json.loads(path.read_text(encoding="utf-8"))
