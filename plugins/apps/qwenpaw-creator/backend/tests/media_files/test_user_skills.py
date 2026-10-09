@@ -93,3 +93,47 @@ def test_concurrent_saves_do_not_lose_config_entries(
     assert saved == set(names)
     for name in names:
         assert (data_root / "skills" / name / "SKILL.md").is_file()
+
+
+def test_same_name_save_and_delete_never_register_a_fileless_skill(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """A delete racing a same-name save must not resurrect a file-less entry.
+
+    The SKILL.md write and the config registration share one critical
+    section, so a concurrent delete runs either wholly before or wholly
+    after the save -- never between the write and the registration (which
+    would leave a registered skill whose directory was just removed).
+    """
+
+    data_root = _prepare(tmp_path, monkeypatch)
+    user_skills.save_user_skill("demo", _skill_md("demo"))
+
+    # Pause the save right after it publishes SKILL.md but before it returns,
+    # so the delete below is guaranteed to run inside that window.
+    written = threading.Event()
+    real_replace = user_skills.atomic_replace_bytes
+
+    def slow_replace(path, data):
+        real_replace(path, data)
+        written.set()
+        time.sleep(0.05)
+
+    monkeypatch.setattr(user_skills, "atomic_replace_bytes", slow_replace)
+
+    saver = threading.Thread(
+        target=user_skills.save_user_skill,
+        args=("demo", _skill_md("demo-v2")),
+    )
+    saver.start()
+    assert written.wait(timeout=5.0), "save never reached the SKILL.md write"
+    user_skills.delete_user_skill("demo")
+    saver.join(timeout=5.0)
+
+    registered = {item.name for item in config.load_skills_config()}
+    if "demo" in registered:
+        assert (data_root / "skills" / "demo" / "SKILL.md").is_file(), (
+            "delete interleaved between the SKILL.md write and the config "
+            "registration, resurrecting 'demo' without its file"
+        )

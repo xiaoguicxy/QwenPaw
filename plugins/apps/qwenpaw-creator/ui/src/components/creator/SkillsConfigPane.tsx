@@ -95,6 +95,7 @@ export default function SkillsConfigPane() {
     setName("");
     setContent(SKILL_TEMPLATE);
     setTruncated(false);
+    setSaving(false);
     setEditorOpen(true);
   };
 
@@ -110,6 +111,7 @@ export default function SkillsConfigPane() {
       setName(item.name);
       setContent(res.content);
       setTruncated(res.truncated);
+      setSaving(false);
       setEditorOpen(true);
     } catch {
       // Never fall back to a saveable template: it would overwrite the real
@@ -131,6 +133,7 @@ export default function SkillsConfigPane() {
       setName(item.name);
       setContent(res.content);
       setTruncated(false);
+      setSaving(false);
       setEditorOpen(true);
     } catch {
       if (seq !== editSeqRef.current) return;
@@ -154,18 +157,26 @@ export default function SkillsConfigPane() {
       message.error(t("skills.nameInvalid"));
       return;
     }
+    // Capture the edit session: if the user closes this modal and opens
+    // another skill before this save resolves, the completion must not close
+    // that newer session and discard its unsaved edits.
+    const seq = editSeqRef.current;
     setSaving(true);
     try {
       await saveSkill(skillName, content);
       message.success(t("skills.saveSuccess"));
-      setEditorOpen(false);
+      if (seq === editSeqRef.current) {
+        setEditorOpen(false);
+      }
       await refresh();
     } catch (error) {
       message.error(
         error instanceof Error ? error.message : t("skills.saveFailed"),
       );
     } finally {
-      setSaving(false);
+      if (seq === editSeqRef.current) {
+        setSaving(false);
+      }
     }
   };
 
