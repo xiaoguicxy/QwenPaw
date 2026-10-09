@@ -161,3 +161,62 @@ def test_content_route_404_for_unknown_skill(
     _configure(tmp_path, monkeypatch, [])
     response = api_request(_app(), "GET", "/skills/nope/content")
     assert response.status_code == 404
+
+
+def test_save_skill_runs_off_the_event_loop(
+    tmp_path,
+    monkeypatch,
+    run_scenario,
+) -> None:
+    """The locked read-modify-write never blocks the ASGI loop either.
+
+    Saving waits on the module-wide skills_config lock and does disk IO, so
+    running it on the loop would stall every other request while a ZIP import
+    worker holds the lock.
+    """
+
+    _configure(tmp_path, monkeypatch, [])
+    save_threads: list[int] = []
+    real_save = skill_routes.save_user_skill
+
+    def recording_save(name, content):
+        save_threads.append(threading.get_ident())
+        return real_save(name, content)
+
+    monkeypatch.setattr(skill_routes, "save_user_skill", recording_save)
+
+    async def scenario(client) -> int:
+        loop_thread = threading.get_ident()
+        response = await client.post(
+            "/skills",
+            json={"name": "demo-skill", "content": _SKILL_MD},
+        )
+        assert response.status_code == 200, response.text
+        return loop_thread
+
+    loop_thread = run_scenario(_app(), scenario)
+    assert save_threads, "save_skill must write the skill"
+    assert all(thread != loop_thread for thread in save_threads)
+
+
+def test_refused_skill_write_surfaces_as_400(
+    tmp_path,
+    monkeypatch,
+    api_request,
+) -> None:
+    """UserSkillError raised inside the worker thread still maps to a 400."""
+
+    _configure(tmp_path, monkeypatch, [])
+
+    def refuse(name, content):
+        raise skill_routes.UserSkillError("技能名与内置技能同名: demo")
+
+    monkeypatch.setattr(skill_routes, "save_user_skill", refuse)
+    response = api_request(
+        _app(),
+        "POST",
+        "/skills",
+        json={"name": "demo-skill", "content": _SKILL_MD},
+    )
+    assert response.status_code == 400
+    assert "内置" in json.dumps(response.json(), ensure_ascii=False)
