@@ -21,7 +21,7 @@ from services.external_skills import (
     SkillExecutionError,
     load_skills,
     parse_skill_md,
-    view_skill,
+    read_skill_content,
 )
 from services.media_files.user_skills import (
     UserSkillError,
@@ -83,13 +83,16 @@ def _data_root_guard(action):
 
 @router.get("")
 async def list_skills() -> dict[str, Any]:
-    return {"items": [_item(skill) for skill in load_skills()]}
+    items = await asyncio.to_thread(
+        lambda: [_item(skill) for skill in load_skills()],
+    )
+    return {"items": items}
 
 
 @router.get("/{name}/content")
 async def get_skill_content(name: str) -> dict[str, Any]:
     try:
-        return view_skill(skill_name=name)
+        return await asyncio.to_thread(read_skill_content, skill_name=name)
     except SkillExecutionError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 

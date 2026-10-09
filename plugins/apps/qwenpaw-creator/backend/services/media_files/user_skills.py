@@ -14,6 +14,7 @@ from __future__ import annotations
 import re
 import shutil
 import tempfile
+import threading
 from pathlib import Path
 
 from models.config import load_skills_config, write_skills_config
@@ -31,6 +32,12 @@ _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 # Skills are plain-text domain knowledge; 32 MiB is far beyond any real
 # SKILL.md bundle and stops accidental huge uploads before extraction.
 _MAX_ZIP_BYTES = 32 * 1024 * 1024
+# Serializes the read-modify-write of skills_config.json across the
+# asyncio.to_thread workers so concurrent save/toggle/delete/import cannot
+# lose each other's updates. Single-process only: a multi-process deployment
+# would need a cross-process lock, since atomic_replace_bytes guarantees a
+# whole-file swap but not a read-modify-write transaction.
+_CONFIG_LOCK = threading.RLock()
 
 
 class UserSkillError(ValueError):
@@ -66,16 +73,19 @@ def save_user_skill(name: str, content: str) -> SkillEntry:
     directory.mkdir(parents=True, exist_ok=True)
     atomic_replace_bytes(directory / "SKILL.md", content.encode("utf-8"))
 
-    entries = list(load_skills_config())
-    existing = next((item for item in entries if item.name == name), None)
-    if existing is not None:
-        entry = existing.model_copy(update={"path": str(directory)})
-        entries = [entry if item.name == name else item for item in entries]
-    else:
-        entry = SkillEntry(name=name, path=str(directory), enabled=True)
-        entries.append(entry)
-    write_skills_config(entries)
-    _clear_load_cache()
+    with _CONFIG_LOCK:
+        entries = list(load_skills_config())
+        existing = next((item for item in entries if item.name == name), None)
+        if existing is not None:
+            entry = existing.model_copy(update={"path": str(directory)})
+            entries = [
+                entry if item.name == name else item for item in entries
+            ]
+        else:
+            entry = SkillEntry(name=name, path=str(directory), enabled=True)
+            entries.append(entry)
+        write_skills_config(entries)
+        _clear_load_cache()
     return entry
 
 
@@ -175,30 +185,32 @@ def import_skills_from_zip_bytes(data: bytes) -> dict:
 def set_user_skill_enabled(name: str, enabled: bool) -> bool:
     """Toggle a configured (non-builtin) skill; report whether it changed."""
 
-    entries = list(load_skills_config())
-    changed = False
-    for index, item in enumerate(entries):
-        if item.name == name:
-            entries[index] = item.model_copy(update={"enabled": enabled})
-            changed = True
-    if changed:
-        write_skills_config(entries)
-        _clear_load_cache()
+    with _CONFIG_LOCK:
+        entries = list(load_skills_config())
+        changed = False
+        for index, item in enumerate(entries):
+            if item.name == name:
+                entries[index] = item.model_copy(update={"enabled": enabled})
+                changed = True
+        if changed:
+            write_skills_config(entries)
+            _clear_load_cache()
     return changed
 
 
 def delete_user_skill(name: str) -> bool:
     """Remove a configured skill entry and its managed directory."""
 
-    entries = list(load_skills_config())
-    remaining = [item for item in entries if item.name != name]
-    if len(remaining) == len(entries):
-        return False
-    write_skills_config(remaining)
-    # name is regex-validated (no separators / ".."), so this stays inside
-    # the managed skills root.
-    shutil.rmtree(_skills_root() / name, ignore_errors=True)
-    _clear_load_cache()
+    with _CONFIG_LOCK:
+        entries = list(load_skills_config())
+        remaining = [item for item in entries if item.name != name]
+        if len(remaining) == len(entries):
+            return False
+        write_skills_config(remaining)
+        # name is regex-validated (no separators / ".."), so this stays inside
+        # the managed skills root.
+        shutil.rmtree(_skills_root() / name, ignore_errors=True)
+        _clear_load_cache()
     return True
 
 
