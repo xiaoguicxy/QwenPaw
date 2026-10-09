@@ -66,7 +66,11 @@ export default function SkillsConfigPane() {
   const [uploading, setUploading] = useState(false);
   const [previewMode, setPreviewMode] = useState(false);
   const [showPreview, setShowPreview] = useState(false);
+  const [truncated, setTruncated] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  // Monotonic guard so a slow openEdit/openPreview read cannot land after a
+  // newer open (or a create) and clobber the modal with stale content.
+  const editSeqRef = useRef(0);
 
   const refresh = useCallback(async () => {
     try {
@@ -84,43 +88,63 @@ export default function SkillsConfigPane() {
   }, [refresh]);
 
   const openCreate = () => {
+    editSeqRef.current += 1;
     setPreviewMode(false);
     setShowPreview(false);
     setEditingName("");
     setName("");
     setContent(SKILL_TEMPLATE);
+    setTruncated(false);
     setEditorOpen(true);
   };
 
   const openEdit = async (item: SkillItem) => {
-    setPreviewMode(false);
-    setShowPreview(false);
-    setEditingName(item.name);
-    setName(item.name);
+    editSeqRef.current += 1;
+    const seq = editSeqRef.current;
     try {
       const res = await getSkillContent(item.name);
+      if (seq !== editSeqRef.current) return;
+      setPreviewMode(false);
+      setShowPreview(false);
+      setEditingName(item.name);
+      setName(item.name);
       setContent(res.content);
+      setTruncated(res.truncated);
+      setEditorOpen(true);
     } catch {
-      setContent(SKILL_TEMPLATE);
+      // Never fall back to a saveable template: it would overwrite the real
+      // skill on save. Surface the failure and leave the modal untouched.
+      if (seq !== editSeqRef.current) return;
+      message.error(t("skills.readFailed"));
     }
-    setEditorOpen(true);
   };
 
   const openPreview = async (item: SkillItem) => {
-    setPreviewMode(true);
-    setShowPreview(true);
-    setEditingName(item.name);
-    setName(item.name);
+    editSeqRef.current += 1;
+    const seq = editSeqRef.current;
     try {
       const res = await getSkillContent(item.name);
+      if (seq !== editSeqRef.current) return;
+      setPreviewMode(true);
+      setShowPreview(true);
+      setEditingName(item.name);
+      setName(item.name);
       setContent(res.content);
+      setTruncated(false);
+      setEditorOpen(true);
     } catch {
-      setContent("");
+      if (seq !== editSeqRef.current) return;
+      message.error(t("skills.readFailed"));
     }
-    setEditorOpen(true);
   };
 
   const handleSave = async () => {
+    if (truncated) {
+      // The editor only holds a truncated copy; saving would silently drop
+      // the unread tail of the real SKILL.md.
+      message.error(t("skills.contentTruncated"));
+      return;
+    }
     const skillName = name.trim();
     if (!skillName) {
       message.error(t("skills.nameRequired"));
@@ -408,6 +432,7 @@ export default function SkillsConfigPane() {
         cancelText={previewMode ? t("common.close") : t("common.cancel")}
         okButtonProps={{
           style: previewMode ? { display: "none" } : undefined,
+          disabled: truncated,
         }}
         confirmLoading={saving}
         onOk={handleSave}

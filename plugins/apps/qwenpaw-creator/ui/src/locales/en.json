@@ -22,6 +22,8 @@
     "nameInvalid": "Invalid skill name: use only lowercase letters, digits, dots, underscores or hyphens, starting with a letter or digit.",
     "nameRule": "The skill name is an identifier: lowercase letters, digits, dots, underscores or hyphens (e.g. my-video-skill). The description and body can be in any language.",
     "loadFailed": "Failed to load skills",
+    "readFailed": "Failed to read skill content",
+    "contentTruncated": "Content is truncated; saving is disabled to avoid overwriting the full skill",
     "saveSuccess": "Skill saved",
     "saveFailed": "Save failed",
     "deleteConfirmTitle": "Delete this skill?",

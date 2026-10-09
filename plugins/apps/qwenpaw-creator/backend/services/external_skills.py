@@ -394,6 +394,10 @@ def find_skill(name: str) -> LoadedSkill:
 
 def _require_available(name: str) -> LoadedSkill:
     skill = find_skill(name)
+    if not skill.entry.enabled:
+        # A skill disabled mid-run must not stay readable through a stale
+        # tool manifest; the management UI uses read_skill_content instead.
+        raise SkillExecutionError(f"skill is disabled: {name}")
     if not skill.available:
         raise SkillExecutionError(
             f"skill {name} is unavailable: {skill.reason}",
@@ -422,6 +426,29 @@ def view_skill(*, skill_name: str) -> dict[str, Any]:
         "skill": skill.entry.name,
         "content": markdown,
         "truncated": truncated,
+    }
+
+
+def read_skill_content(*, skill_name: str) -> dict[str, Any]:
+    """Management-side raw SKILL.md reader for the configuration UI.
+
+    Unlike the agent-facing :func:`view_skill`, this bypasses the
+    ``available``/``enabled`` gates and the viewer byte cap so the editor
+    always round-trips the whole file: a disabled or unavailable skill can
+    still be read (and fixed) instead of being silently truncated on save.
+    """
+
+    skill = find_skill(skill_name)
+    markdown_path = skill.root / "SKILL.md"
+    if not markdown_path.is_file():
+        raise SkillExecutionError(
+            f"SKILL.md not found for skill: {skill_name}",
+        )
+    return {
+        "ok": True,
+        "skill": skill.entry.name,
+        "content": markdown_path.read_text(encoding="utf-8"),
+        "truncated": False,
     }
 
 
@@ -493,6 +520,7 @@ __all__ = [
     "find_skill",
     "load_skills",
     "parse_skill_md",
+    "read_skill_content",
     "render_external_skills_context",
     "view_skill",
 ]
