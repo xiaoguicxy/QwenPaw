@@ -207,7 +207,7 @@ class _Resp:
                 "base_resp": {
                     "status_code": 2013,
                     "status_msg": "task not found",
-                }
+                },
             },
             True,
             None,
@@ -218,7 +218,9 @@ class _Resp:
     ],
 )
 def test_minimax_base_resp_error_surfaces_http200_failures(
-    body, valid, expect_fragment
+    body,
+    valid,
+    expect_fragment,
 ) -> None:
     msg = _minimax_base_resp_error(_Resp(body, valid_json=valid))
     if expect_fragment is None:
