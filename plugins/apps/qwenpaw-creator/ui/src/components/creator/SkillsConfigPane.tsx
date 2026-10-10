@@ -550,6 +550,7 @@ export default function SkillsConfigPane() {
         onOk={handleSave}
         onCancel={() => setEditorOpen(false)}
         width={720}
+        centered
       >
         <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
           {!previewMode && (
@@ -659,6 +660,7 @@ export default function SkillsConfigPane() {
         onOk={handleImportUrl}
         onCancel={() => setUrlOpen(false)}
         width={520}
+        centered
       >
         <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
           <div>
