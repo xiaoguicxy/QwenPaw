@@ -6,8 +6,8 @@ import {
   waitFor,
   within,
 } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { ConfigProvider } from "antd";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { ConfigProvider, message } from "antd";
 import SkillsConfigPane from "../SkillsConfigPane";
 import type { SkillContent, SkillItem } from "@/api/creator/skills";
 import zh from "@/locales/zh.json";
@@ -16,13 +16,13 @@ import zh from "@/locales/zh.json";
 // the editor moves on to "beta" -- the state transition the save-completion
 // sequence guard defends against (see the note inside that test on why the
 // drive-through is synthetic rather than user-reachable).
-const { listSkillsMock, getSkillContentMock, saveSkillMock } = vi.hoisted(
-  () => ({
+const { listSkillsMock, getSkillContentMock, saveSkillMock, importUrlMock } =
+  vi.hoisted(() => ({
     listSkillsMock: vi.fn(),
     getSkillContentMock: vi.fn(),
     saveSkillMock: vi.fn(),
-  }),
-);
+    importUrlMock: vi.fn(),
+  }));
 
 vi.mock("@/api/creator", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/api/creator")>();
@@ -31,6 +31,7 @@ vi.mock("@/api/creator", async (importOriginal) => {
     listSkills: listSkillsMock,
     getSkillContent: getSkillContentMock,
     saveSkill: saveSkillMock,
+    importSkillFromUrl: importUrlMock,
   };
 });
 
@@ -175,6 +176,141 @@ describe("SkillsConfigPane editor session guard", () => {
       "alpha original body",
       true,
     );
+  });
+});
+
+/** Open the URL import dialog through the "Add skill" dropdown. */
+async function openUrlImportDialog(): Promise<void> {
+  fireEvent.click(screen.getByRole("button", { name: zh.skills.add }));
+  const item = await screen.findByRole("menuitem", {
+    name: zh.skills.importUrl,
+  });
+  fireEvent.click(item);
+  await screen.findByRole("dialog");
+}
+
+const _URL_INPUT = "https://skills.sh/owner/repo/skill";
+
+function urlInput(): HTMLElement {
+  return screen.getByPlaceholderText(_URL_INPUT);
+}
+
+function importNameInput(): HTMLElement {
+  return screen.getByPlaceholderText(zh.skills.importUrlNamePlaceholder);
+}
+
+function importButton(): HTMLElement {
+  const name = new RegExp(zh.common.import.split("").join("\\s*"));
+  return within(screen.getByRole("dialog")).getByRole("button", { name });
+}
+
+function importResult(name: string): Record<string, unknown> {
+  return {
+    imported: [name],
+    skipped: [],
+    count: 1,
+    name,
+    renamed_from: null,
+    source_url: _URL_INPUT,
+    installed_from: "skills-sh",
+    ignored_files: 0,
+  };
+}
+
+describe("SkillsConfigPane URL import", () => {
+  beforeEach(() => {
+    importUrlMock.mockReset();
+    listSkillsMock.mockResolvedValue({
+      items: [skillItem("alpha"), skillItem("beta")],
+    });
+    getSkillContentMock.mockImplementation((name: string) =>
+      Promise.resolve(skillContent(name)),
+    );
+  });
+
+  // antd renders toasts into a portal on document.body that outlives the
+  // rendered tree, so a refusal left here would also match a later case's
+  // inline hint by text and make findByText resolve to multiple elements.
+  afterEach(async () => {
+    await act(async () => {
+      message.destroy();
+    });
+  });
+
+  it("refuses an import whose chosen name already exists", async () => {
+    // Same rule as the create flow, on the import path: an occupied name is
+    // someone else's skill, and the panel must not offer that submit.
+    importUrlMock.mockResolvedValue(importResult("alpha"));
+
+    renderPane();
+    await screen.findByText("alpha");
+    await openUrlImportDialog();
+
+    fireEvent.change(urlInput(), {
+      target: { value: "https://skills.sh/acme/skills/alpha" },
+    });
+    fireEvent.change(importNameInput(), { target: { value: "alpha" } });
+
+    expect(await screen.findByText(zh.skills.nameTaken)).toBeInTheDocument();
+    expect(importButton()).toBeDisabled();
+    await act(async () => {
+      clickDialogButton(zh.common.import);
+    });
+    expect(importUrlMock).not.toHaveBeenCalled();
+
+    // A free name is an ordinary import again: no warning, submit restored.
+    fireEvent.change(importNameInput(), { target: { value: "gamma" } });
+    expect(screen.queryByText(zh.skills.nameTaken)).toBeNull();
+    expect(importButton()).toBeEnabled();
+  });
+
+  it("imports a skill from the URL and refreshes the list", async () => {
+    importUrlMock.mockResolvedValue(importResult("hub-skill"));
+
+    renderPane();
+    await screen.findByText("alpha");
+    const initialLoads = listSkillsMock.mock.calls.length;
+    await openUrlImportDialog();
+
+    // An untrimmed URL is what the user pasted; the request must carry the
+    // trimmed one, and no name means the remote bundle decides.
+    fireEvent.change(urlInput(), {
+      target: { value: "  https://skills.sh/acme/skills/hub-skill  " },
+    });
+    await act(async () => {
+      clickDialogButton(zh.common.import);
+    });
+
+    expect(importUrlMock).toHaveBeenCalledWith(
+      "https://skills.sh/acme/skills/hub-skill",
+      "",
+    );
+    expect(
+      await screen.findByText(`${zh.skills.importUrlSuccess}: hub-skill`),
+    ).toBeInTheDocument();
+    await waitFor(() =>
+      expect(listSkillsMock.mock.calls.length).toBeGreaterThan(initialLoads),
+    );
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("surfaces the backend refusal instead of a generic failure", async () => {
+    // The server is the authority on names and market reachability; its
+    // reason is what has to reach the user.
+    importUrlMock.mockRejectedValue(new Error("技能名已存在: alpha"));
+
+    renderPane();
+    await screen.findByText("alpha");
+    await openUrlImportDialog();
+    fireEvent.change(urlInput(), {
+      target: { value: "https://skills.sh/acme/skills/alpha" },
+    });
+    await act(async () => {
+      clickDialogButton(zh.common.import);
+    });
+
+    expect(await screen.findByText("技能名已存在: alpha")).toBeInTheDocument();
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
   });
 });
 

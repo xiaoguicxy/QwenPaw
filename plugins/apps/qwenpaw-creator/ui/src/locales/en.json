@@ -34,7 +34,19 @@
     "uploadSuccess": "Imported",
     "uploadNoSkill": "No valid skill found in the ZIP (SKILL.md required)",
     "uploadSkipped": "Skipped",
-    "uploadFailed": "Import failed"
+    "uploadFailed": "Import failed",
+    "importUrl": "Import from URL",
+    "importUrlTitle": "Import a skill from a marketplace URL",
+    "importUrlLabel": "Skill URL",
+    "urlInvalid": "Enter a URL starting with http:// or https://",
+    "importUrlNameLabel": "Skill name (optional)",
+    "importUrlNamePlaceholder": "Leave empty to use the remote name",
+    "importUrlNameHint": "Empty keeps the name the remote bundle declares; a non-conforming remote name is folded into a lowercase slug. An import never replaces a skill that already has that name.",
+    "importUrlHint": "Same sources as the Skill Pool: skill pages on the QwenPaw skill platform, skills.sh, GitHub, ClawHub, LobeHub, ModelScope and SkillsMP. Only the SKILL.md body is kept as domain knowledge.",
+    "importUrlSuccess": "Imported from URL",
+    "importUrlRenamed": "Remote skill name was not a valid identifier; used {{to}} instead of {{from}}",
+    "importUrlIgnored": "Ignored {{count}} attached file(s) (a skill is its SKILL.md body only)",
+    "importUrlFailed": "URL import failed"
   },
   "feedback": {
     "action": "Feedback",

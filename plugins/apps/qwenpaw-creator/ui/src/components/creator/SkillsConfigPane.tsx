@@ -7,12 +7,13 @@ import {
 } from "react";
 import { useTranslation } from "react-i18next";
 import { Button, Dropdown, Input, Modal, Switch, Tooltip, message } from "antd";
-import { Eye, Pencil, Plus, Trash2, Upload } from "lucide-react";
+import { Eye, Globe, Pencil, Plus, Trash2, Upload } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
   deleteSkill,
   getSkillContent,
+  importSkillFromUrl,
   listSkills,
   saveSkill,
   setSkillEnabled,
@@ -55,6 +56,9 @@ function stripFrontmatter(text: string): string {
 /** Skill names are filesystem identifiers — a lowercase slug (matches backend). */
 const SKILL_NAME_RE = /^[a-z0-9][a-z0-9._-]*$/;
 
+/** The backend refuses anything else, and a market page URL is never a bare host. */
+const SKILL_URL_RE = /^https?:\/\//;
+
 export default function SkillsConfigPane() {
   const { t } = useTranslation();
   const [items, setItems] = useState<SkillItem[]>([]);
@@ -64,6 +68,10 @@ export default function SkillsConfigPane() {
   const [content, setContent] = useState(SKILL_TEMPLATE);
   const [saving, setSaving] = useState(false);
   const [uploading, setUploading] = useState(false);
+  const [urlOpen, setUrlOpen] = useState(false);
+  const [urlValue, setUrlValue] = useState("");
+  const [urlTarget, setUrlTarget] = useState("");
+  const [importingUrl, setImportingUrl] = useState(false);
   const [previewMode, setPreviewMode] = useState(false);
   const [showPreview, setShowPreview] = useState(false);
   const [truncated, setTruncated] = useState(false);
@@ -71,6 +79,9 @@ export default function SkillsConfigPane() {
   // Monotonic guard so a slow openEdit/openPreview read cannot land after a
   // newer open (or a create) and clobber the modal with stale content.
   const editSeqRef = useRef(0);
+  // Same guard for the URL import: it owns closing and clearing that modal,
+  // so a late completion cannot touch a session the user already restarted.
+  const importSeqRef = useRef(0);
 
   const refresh = useCallback(async () => {
     try {
@@ -252,6 +263,68 @@ export default function SkillsConfigPane() {
     }
   };
 
+  const openUrlImport = () => {
+    setUrlValue("");
+    setUrlTarget("");
+    setUrlOpen(true);
+  };
+
+  const handleImportUrl = async () => {
+    const bundleUrl = urlValue.trim();
+    if (!SKILL_URL_RE.test(bundleUrl)) {
+      message.warning(t("skills.urlInvalid"));
+      return;
+    }
+    const target = urlTarget.trim();
+    // Defense-in-depth: the modal disables submit on both of these, so the
+    // user already sees the reason inline before this can run.
+    if (target && !SKILL_NAME_RE.test(target)) {
+      message.error(t("skills.nameInvalid"));
+      return;
+    }
+    // An optional name is still a create, so an occupied one is refused
+    // rather than replaced; block it here instead of letting the user
+    // discover it from the backend's 400.
+    if (target && items.some((item) => item.name === target)) {
+      message.error(t("skills.nameTaken"));
+      return;
+    }
+    const seq = importSeqRef.current + 1;
+    importSeqRef.current = seq;
+    setImportingUrl(true);
+    try {
+      const res = await importSkillFromUrl(bundleUrl, target);
+      message.success(`${t("skills.importUrlSuccess")}: ${res.name}`);
+      if (res.renamed_from) {
+        message.warning(
+          t("skills.importUrlRenamed", {
+            from: res.renamed_from,
+            to: res.name,
+          }),
+        );
+      }
+      if (res.ignored_files > 0) {
+        message.info(
+          t("skills.importUrlIgnored", { count: res.ignored_files }),
+        );
+      }
+      if (seq === importSeqRef.current) {
+        setUrlOpen(false);
+        setUrlValue("");
+        setUrlTarget("");
+      }
+      await refresh();
+    } catch (error) {
+      message.error(
+        error instanceof Error ? error.message : t("skills.importUrlFailed"),
+      );
+    } finally {
+      if (seq === importSeqRef.current) {
+        setImportingUrl(false);
+      }
+    }
+  };
+
   const nameInvalid =
     !editingName && name.trim().length > 0 && !SKILL_NAME_RE.test(name.trim());
   // Creating on an occupied name would replace that skill's SKILL.md; the
@@ -260,6 +333,15 @@ export default function SkillsConfigPane() {
     !editingName &&
     SKILL_NAME_RE.test(name.trim()) &&
     items.some((item) => item.name === name.trim());
+  // The URL import takes an optional name, and supplying one makes it a
+  // create under that name -- so the create dialog's rules apply verbatim.
+  const urlTargetName = urlTarget.trim();
+  const urlTargetInvalid =
+    urlTargetName !== "" && !SKILL_NAME_RE.test(urlTargetName);
+  const urlTargetTaken =
+    !urlTargetInvalid && items.some((item) => item.name === urlTargetName);
+  const urlReady =
+    SKILL_URL_RE.test(urlValue.trim()) && !urlTargetInvalid && !urlTargetTaken;
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
@@ -300,6 +382,12 @@ export default function SkillsConfigPane() {
                 label: t("skills.uploadZip"),
                 icon: <Upload size={14} />,
                 onClick: handleUploadZip,
+              },
+              {
+                key: "importUrl",
+                label: t("skills.importUrl"),
+                icon: <Globe size={14} />,
+                onClick: openUrlImport,
               },
             ],
           }}
@@ -558,6 +646,80 @@ export default function SkillsConfigPane() {
               {t("skills.editorHint")}
             </div>
           )}
+        </div>
+      </Modal>
+
+      <Modal
+        open={urlOpen}
+        title={t("skills.importUrlTitle")}
+        okText={t("common.import")}
+        cancelText={t("common.cancel")}
+        okButtonProps={{ disabled: !urlReady }}
+        confirmLoading={importingUrl}
+        onOk={handleImportUrl}
+        onCancel={() => setUrlOpen(false)}
+        width={520}
+      >
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          <div>
+            <label className="field-label">{t("skills.importUrlLabel")}</label>
+            <Input
+              value={urlValue}
+              placeholder="https://skills.sh/owner/repo/skill"
+              onChange={(event) => setUrlValue(event.target.value)}
+            />
+            {!SKILL_URL_RE.test(urlValue.trim()) && (
+              <div
+                style={{
+                  fontSize: 11,
+                  marginTop: 4,
+                  lineHeight: 1.5,
+                  color:
+                    urlValue.trim().length > 0
+                      ? "var(--color-error)"
+                      : "var(--color-text-tertiary)",
+                }}
+              >
+                {t("skills.urlInvalid")}
+              </div>
+            )}
+          </div>
+          <div>
+            <label className="field-label">
+              {t("skills.importUrlNameLabel")}
+            </label>
+            <Input
+              value={urlTarget}
+              placeholder={t("skills.importUrlNamePlaceholder")}
+              onChange={(event) => setUrlTarget(event.target.value)}
+            />
+            <div
+              style={{
+                fontSize: 11,
+                marginTop: 4,
+                lineHeight: 1.5,
+                color:
+                  urlTargetInvalid || urlTargetTaken
+                    ? "var(--color-error)"
+                    : "var(--color-text-tertiary)",
+              }}
+            >
+              {urlTargetInvalid
+                ? t("skills.nameInvalid")
+                : urlTargetTaken
+                ? t("skills.nameTaken")
+                : t("skills.importUrlNameHint")}
+            </div>
+          </div>
+          <div
+            style={{
+              fontSize: 11.5,
+              color: "var(--color-text-tertiary)",
+              lineHeight: 1.6,
+            }}
+          >
+            {t("skills.importUrlHint")}
+          </div>
         </div>
       </Modal>
     </div>

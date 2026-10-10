@@ -71,3 +71,33 @@ export function uploadSkillZip(file: File): Promise<SkillImportResult> {
     body: form,
   });
 }
+
+export interface SkillUrlImportResult extends SkillImportResult {
+  name: string;
+  // The market name when it had to be folded into a valid slug, else null.
+  renamed_from: string | null;
+  source_url: string;
+  installed_from: string;
+  // references/scripts/extra_files dropped by design: a Creator skill is
+  // only its SKILL.md text.
+  ignored_files: number;
+}
+
+export function importSkillFromUrl(
+  bundleUrl: string,
+  targetName?: string,
+): Promise<SkillUrlImportResult> {
+  return creatorRequest<SkillUrlImportResult>(
+    "/skills/import-url",
+    {
+      method: "POST",
+      body: jsonBody({
+        bundle_url: bundleUrl,
+        target_name: (targetName || "").trim() || null,
+      }),
+    },
+    // The server budgets 90s for one market download, so give up a little
+    // after it: the backend's own timeout explanation beats a bare 408.
+    { timeoutMs: 100_000 },
+  );
+}
