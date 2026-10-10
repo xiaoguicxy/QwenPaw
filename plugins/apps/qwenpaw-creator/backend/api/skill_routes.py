@@ -28,12 +28,14 @@ from services.external_skills import (
     read_skill_content,
 )
 from services.media_files.user_skills import (
+    MAX_SKILL_ZIP_BYTES,
     UserSkillError,
     delete_user_skill,
     import_skills_from_zip_bytes,
     install_skill_from_hub_bundle,
     save_user_skill,
     set_user_skill_enabled,
+    zip_too_large_detail,
 )
 from services.skill_hub import (
     SkillHubTimeout,
@@ -137,6 +139,15 @@ async def save_skill(request: SaveSkillRequest) -> dict[str, Any]:
 async def upload_skill_zip(request: Request) -> dict[str, Any]:
     """Import one or more skills from an uploaded zip (SKILL.md bundle)."""
 
+    # Refuse an oversized body before parsing it: the multipart reader spools
+    # the upload to a temporary file and read() then pulls it into memory, so
+    # without this the importer's own size check ran only after both had
+    # happened. A chunked upload declares no length and falls through to the
+    # bounded read below.
+    declared = request.headers.get("content-length")
+    if declared is not None and declared.isdigit():
+        if int(declared) > MAX_SKILL_ZIP_BYTES:
+            raise HTTPException(400, detail=zip_too_large_detail())
     form = await request.form()
     upload = next(
         (
@@ -151,7 +162,10 @@ async def upload_skill_zip(request: Request) -> dict[str, Any]:
     filename = Path(upload.filename or "").name
     if not filename.lower().endswith(".zip"):
         raise HTTPException(status_code=400, detail="仅支持 .zip 文件")
-    data = await upload.read()
+    # One byte past the cap is enough to refuse and keeps an over-limit body
+    # out of memory. The importer re-checks: it is also reachable without
+    # this route.
+    data = await upload.read(MAX_SKILL_ZIP_BYTES + 1)
     return await asyncio.to_thread(
         _data_root_guard,
         lambda: import_skills_from_zip_bytes(data),

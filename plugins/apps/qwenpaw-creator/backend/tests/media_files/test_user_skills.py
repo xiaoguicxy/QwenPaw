@@ -463,3 +463,132 @@ def test_hub_import_never_replaces_an_existing_skill(
     assert (data_root / "skills" / "hub-skill" / "SKILL.md").read_text(
         encoding="utf-8",
     ) == original
+
+
+def test_long_name_is_refused_before_anything_is_written(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """An over-long name must fail before SKILL.md exists, not after it.
+
+    ``SkillEntry`` caps the name at 64 characters, so a longer one used to
+    write the document and only then fail registration: the directory stayed
+    behind unregistered (delete drops registered entries only), which no
+    panel action could remove and which kept the name taken for every later
+    create.
+    """
+
+    data_root = _prepare(tmp_path, monkeypatch)
+    long_name = "s" * 65
+
+    with pytest.raises(user_skills.UserSkillError, match="64"):
+        user_skills.save_user_skill(long_name, _skill_md(long_name))
+
+    assert not (data_root / "skills" / long_name).exists()
+    # The name check runs before the managed root is even created; what has
+    # to hold either way is that no skill directory is left behind.
+    skills_root = data_root / "skills"
+    assert not skills_root.exists() or not list(skills_root.iterdir())
+    assert not config.load_skills_config()
+    # Nothing was registered, so there is nothing to delete either.
+    assert user_skills.delete_user_skill(long_name) is False
+    # The refused create left the root usable rather than poisoned.
+    assert user_skills.save_user_skill("demo", _skill_md("demo")).name == (
+        "demo"
+    )
+
+
+def test_zip_import_refuses_an_over_budget_bundle_before_installing(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """A skill bundle carries its own budget, checked before any write.
+
+    Inheriting the Project archive budget let a 32 MiB zip ask for 16 GiB of
+    expansion and 20000 members on a shared backend. Both samples here are a
+    few hundred bytes; the caps are patched down to match.
+    """
+
+    data_root = _prepare(tmp_path, monkeypatch)
+
+    # Too many members for a text bundle.
+    monkeypatch.setattr(user_skills, "_MAX_SKILL_MEMBERS", 2)
+    payload = io.BytesIO()
+    with zipfile.ZipFile(payload, "w") as archive:
+        for index in range(3):
+            archive.writestr(f"s{index}/SKILL.md", _skill_md(f"s{index}"))
+    with pytest.raises(
+        user_skills.UserSkillError,
+        match="more than 2 entries",
+    ):
+        user_skills.import_skills_from_zip_bytes(payload.getvalue())
+    assert not config.load_skills_config()
+    assert not list((data_root / "skills").iterdir())
+
+    # Too much expansion: refused on the declared sizes, before a byte is
+    # written out, so nothing reaches the data root either.
+    monkeypatch.setattr(user_skills, "_MAX_SKILL_MEMBERS", 256)
+    monkeypatch.setattr(user_skills, "_MAX_SKILL_EXTRACTED_BYTES", 32)
+    payload = io.BytesIO()
+    with zipfile.ZipFile(payload, "w", zipfile.ZIP_STORED) as archive:
+        archive.writestr("big/SKILL.md", _skill_md("big") + "x" * 64)
+    with pytest.raises(user_skills.UserSkillError, match="expands beyond"):
+        user_skills.import_skills_from_zip_bytes(payload.getvalue())
+    assert not config.load_skills_config()
+    assert not list((data_root / "skills").iterdir())
+
+
+def test_zip_import_skips_a_member_whose_document_is_over_the_cap(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """One oversized SKILL.md skips itself instead of being parsed and kept.
+
+    The document is read whole before it is parsed, so an uncapped member
+    would take the memory first and be refused only afterwards -- and one bad
+    member must never abort the rest of the batch.
+    """
+
+    _prepare(tmp_path, monkeypatch)
+    monkeypatch.setattr(user_skills, "_MAX_SKILL_DOC_BYTES", 2048)
+    payload = io.BytesIO()
+    with zipfile.ZipFile(payload, "w") as archive:
+        archive.writestr("huge/SKILL.md", _skill_md("huge") + "x" * 4096)
+        archive.writestr("small/SKILL.md", _skill_md("small"))
+
+    result = user_skills.import_skills_from_zip_bytes(payload.getvalue())
+
+    assert result["imported"] == ["small"]
+    assert [item["name"] for item in result["skipped"]] == ["huge"]
+    assert "超过 2KB 上限" in result["skipped"][0]["reason"]
+    assert {item.name for item in config.load_skills_config()} == {"small"}
+
+
+def test_oversized_document_is_refused_by_every_writer(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """The document cap lives where the write happens, so no path skips it.
+
+    The ZIP importer reports an oversized member as skipped; the editor save
+    and a hub bundle have to fail the request instead of storing it, because
+    neither the save route's schema nor the host downloader bounds it.
+    """
+
+    data_root = _prepare(tmp_path, monkeypatch)
+    monkeypatch.setattr(user_skills, "_MAX_SKILL_DOC_BYTES", 2048)
+    oversized = _skill_md("huge") + "x" * 4096
+
+    with pytest.raises(user_skills.UserSkillError, match="超过 2KB 上限"):
+        user_skills.save_user_skill("editor-huge", oversized)
+    with pytest.raises(user_skills.UserSkillError, match="超过 2KB 上限"):
+        user_skills.install_skill_from_hub_bundle(
+            _hub_bundle("hub-huge", oversized),
+        )
+
+    assert not config.load_skills_config()
+    assert not list((data_root / "skills").iterdir())
+    # A document inside the cap still saves, so the refusal is the cap.
+    assert user_skills.save_user_skill("demo", _skill_md("demo")).name == (
+        "demo"
+    )
