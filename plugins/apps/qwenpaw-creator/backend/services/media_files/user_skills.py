@@ -38,9 +38,26 @@ logger = setup_logger("services.media_files.user_skills")
 
 _USER_SKILL_DIR_NAME = "skills"
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
+# Mirrors SkillEntry.name's max_length: an over-long name that only fails
+# registration would leave SKILL.md written and the directory unregistered,
+# which no delete can then remove (delete only drops registered entries) and
+# which makes the name permanently "taken" for every later create.
+_MAX_NAME_CHARS = 64
 # Skills are plain-text domain knowledge; 32 MiB is far beyond any real
 # SKILL.md bundle and stops accidental huge uploads before extraction.
-_MAX_ZIP_BYTES = 32 * 1024 * 1024
+MAX_SKILL_ZIP_BYTES = 32 * 1024 * 1024
+# A skill bundle is text, so it carries its own budget instead of inheriting
+# the Project archive's 16 GiB expansion headroom and 20000 members. The
+# extractor enforces these against the bytes actually written, which also
+# covers a member declaring less than it carries.
+_MAX_SKILL_EXTRACTED_BYTES = 32 * 1024 * 1024
+_MAX_SKILL_MEMBERS = 256
+# One SKILL.md is parsed whole and then written to the data root, so this
+# bounds both the memory one document can take and what can land there, for
+# every writer (editor save, ZIP member, hub bundle). Attachments are
+# deliberately not capped per member (they are discarded, and a total cap
+# already bounds them).
+_MAX_SKILL_DOC_BYTES = 1024 * 1024
 # Serializes the read-modify-write of skills_config.json for every writer
 # (route work dispatched through asyncio.to_thread, plus the ZIP import
 # worker) so concurrent save/toggle/delete/import cannot lose each other's
@@ -119,6 +136,10 @@ def _validated_dir(name: str) -> Path:
         raise UserSkillError(
             "技能名只能包含小写字母、数字、点、下划线、连字符，且以字母或数字开头",
         )
+    if len(name) > _MAX_NAME_CHARS:
+        raise UserSkillError(
+            f"技能名最多 {_MAX_NAME_CHARS} 个字符（当前 {len(name)}）",
+        )
     return _skills_root() / name
 
 
@@ -157,6 +178,12 @@ def save_user_skill(
     """
 
     directory = _validated_dir(name)
+    # Encoded once: the budget check and the write both need these bytes, and
+    # checking before parse_skill_md refuses an oversized document before the
+    # YAML parse rather than after it.
+    encoded = content.encode("utf-8")
+    if len(encoded) > _MAX_SKILL_DOC_BYTES:
+        raise UserSkillError(_skill_doc_too_large_detail())
     try:
         parse_skill_md(content)
     except Exception as exc:
@@ -189,7 +216,7 @@ def save_user_skill(
         # a concurrent delete cannot remove the directory in between and leave
         # a registered entry whose file is gone (resurrected as unavailable).
         directory.mkdir(parents=True, exist_ok=True)
-        atomic_replace_bytes(directory / "SKILL.md", content.encode("utf-8"))
+        atomic_replace_bytes(directory / "SKILL.md", encoded)
         if existing is not None:
             entry = existing.model_copy(update={"path": str(directory)})
             entries = [
@@ -230,6 +257,47 @@ def _builtin_skill_names() -> set[str]:
         return set()
 
 
+def zip_too_large_detail() -> str:
+    """Refusal text shared by the upload route and the importer.
+
+    The route needs it before it has read anything, the importer needs it
+    because it is also reachable without that route; one source keeps the
+    two answers identical.
+    """
+
+    return f"ZIP 超过 {MAX_SKILL_ZIP_BYTES // (1024 * 1024)}MB 上限"
+
+
+def _skill_doc_too_large_detail() -> str:
+    """Refusal text shared by every path that writes a SKILL.md.
+
+    The ZIP importer reports it as a skipped member and ``save_user_skill``
+    raises it as a request failure; one source keeps the limit and its wording
+    from drifting apart between the two.
+    """
+
+    return f"SKILL.md 超过 {_MAX_SKILL_DOC_BYTES // 1024}KB 上限"
+
+
+def _read_skill_doc(path: Path) -> str:
+    """Read one SKILL.md within the document budget.
+
+    ``read_text`` would buffer a member of whatever size the archive budget
+    allowed; reading one byte past the cap keeps both this member's memory
+    and what can reach the data root bounded, and turns an oversized
+    document into a reported skip instead of an allocation.
+    """
+
+    with path.open("rb") as handle:
+        raw = handle.read(_MAX_SKILL_DOC_BYTES + 1)
+    if len(raw) > _MAX_SKILL_DOC_BYTES:
+        raise UserSkillError(_skill_doc_too_large_detail())
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise UserSkillError(f"SKILL.md 不是有效的 UTF-8 文本：{exc}") from exc
+
+
 def import_skills_from_zip_bytes(data: bytes) -> dict:
     """Extract an uploaded zip and install each SKILL.md as a user skill.
 
@@ -241,12 +309,13 @@ def import_skills_from_zip_bytes(data: bytes) -> dict:
     overwriting anything or aborting the whole import.
     """
 
-    if len(data) > _MAX_ZIP_BYTES:
-        raise UserSkillError(
-            f"ZIP 超过 {_MAX_ZIP_BYTES // (1024 * 1024)}MB 上限",
-        )
+    if len(data) > MAX_SKILL_ZIP_BYTES:
+        raise UserSkillError(zip_too_large_detail())
     from domain.errors import BadRequestError
-    from services.project_files.archive import extract_archive
+    from services.project_files.archive import (
+        archive_limits,
+        extract_archive,
+    )
 
     imported: list[str] = []
     skipped: list[dict] = []
@@ -263,7 +332,15 @@ def import_skills_from_zip_bytes(data: bytes) -> dict:
         zip_path = Path(tmp) / "upload.zip"
         zip_path.write_bytes(data)
         try:
-            extract_archive(zip_path, extract_dir)
+            extract_archive(
+                zip_path,
+                extract_dir,
+                limits=archive_limits(
+                    max_archive_bytes=MAX_SKILL_ZIP_BYTES,
+                    max_extracted_bytes=_MAX_SKILL_EXTRACTED_BYTES,
+                    max_members=_MAX_SKILL_MEMBERS,
+                ),
+            )
         except BadRequestError as exc:
             raise UserSkillError(f"ZIP 无效：{exc}") from exc
         skill_dirs = _locate_skill_dirs(extract_dir)
@@ -274,9 +351,7 @@ def import_skills_from_zip_bytes(data: bytes) -> dict:
         for directory in skill_dirs:
             label = directory.name
             try:
-                content = (directory / "SKILL.md").read_text(
-                    encoding="utf-8",
-                )
+                content = _read_skill_doc(directory / "SKILL.md")
                 parsed = parse_skill_md(content)
                 fm_name = (parsed.get("name") or "").strip()
                 if _NAME_RE.match(fm_name):
@@ -416,10 +491,12 @@ def delete_user_skill(name: str) -> bool:
 
 
 __all__ = [
+    "MAX_SKILL_ZIP_BYTES",
     "UserSkillError",
     "delete_user_skill",
     "import_skills_from_zip_bytes",
     "install_skill_from_hub_bundle",
     "save_user_skill",
     "set_user_skill_enabled",
+    "zip_too_large_detail",
 ]

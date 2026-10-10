@@ -558,7 +558,7 @@ export default function SkillsConfigPane() {
               <label className="field-label">{t("skills.name")}</label>
               <Input
                 value={name}
-                disabled={!!editingName}
+                disabled={!!editingName || saving}
                 status={nameInvalid || nameTaken ? "error" : undefined}
                 placeholder="my-video-editing-skill"
                 onChange={(event) => setName(event.target.value)}
@@ -606,6 +606,7 @@ export default function SkillsConfigPane() {
                 <Switch
                   size="small"
                   checked={showPreview}
+                  disabled={saving}
                   onChange={setShowPreview}
                 />
               </div>
@@ -628,10 +629,14 @@ export default function SkillsConfigPane() {
                 </ReactMarkdown>
               </div>
             ) : (
+              // Frozen while a save is in flight. The request carries the
+              // content as of the click and success closes this same session,
+              // so anything typed afterwards would be dropped silently;
+              // editSeqRef tells sessions apart, not drafts inside one.
               <Input.TextArea
                 rows={16}
                 value={content}
-                readOnly={previewMode}
+                readOnly={previewMode || saving}
                 onChange={(event) => setContent(event.target.value)}
               />
             )}
@@ -663,10 +668,15 @@ export default function SkillsConfigPane() {
         centered
       >
         <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          {/* Frozen while an import is in flight, for the same reason as the
+              editor body: the request carries these values as of the click and
+              success closes this dialog and clears both, so a URL retyped
+              during the wait would vanish without a word. */}
           <div>
             <label className="field-label">{t("skills.importUrlLabel")}</label>
             <Input
               value={urlValue}
+              readOnly={importingUrl}
               placeholder="https://skills.sh/owner/repo/skill"
               onChange={(event) => setUrlValue(event.target.value)}
             />
@@ -692,6 +702,7 @@ export default function SkillsConfigPane() {
             </label>
             <Input
               value={urlTarget}
+              readOnly={importingUrl}
               placeholder={t("skills.importUrlNamePlaceholder")}
               onChange={(event) => setUrlTarget(event.target.value)}
             />

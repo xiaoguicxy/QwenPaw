@@ -6,6 +6,7 @@ import {
   waitFor,
   within,
 } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ConfigProvider, message } from "antd";
 import SkillsConfigPane from "../SkillsConfigPane";
@@ -365,5 +366,123 @@ describe("SkillsConfigPane duplicate skill name", () => {
       expect.any(String),
       false,
     );
+  });
+});
+
+describe("SkillsConfigPane pending-write freeze", () => {
+  beforeEach(() => {
+    saveSkillMock.mockReset();
+    importUrlMock.mockReset();
+    listSkillsMock.mockResolvedValue({
+      items: [skillItem("alpha"), skillItem("beta")],
+    });
+    getSkillContentMock.mockImplementation((name: string) =>
+      Promise.resolve(skillContent(name)),
+    );
+  });
+
+  // antd renders toasts into a portal on document.body that outlives the
+  // rendered tree, so one left here would match a later case's inline hint.
+  afterEach(async () => {
+    await act(async () => {
+      message.destroy();
+    });
+  });
+
+  // focus + keyboard rather than type(): a write in flight puts antd's
+  // confirmLoading on the dialog, and what these cases assert is whether
+  // keystrokes reach the field, not where a click lands. jsdom leaves the
+  // caret at 0 on focus, so move it to the end the way a click into an
+  // already-filled editor would -- otherwise the typing prepends.
+  function focusAndType(element: HTMLElement, text: string) {
+    const field = element as HTMLInputElement | HTMLTextAreaElement;
+    field.focus();
+    field.setSelectionRange(field.value.length, field.value.length);
+    return userEvent.setup().keyboard(text);
+  }
+
+  it("freezes the editor body so a save cannot drop what is typed next", async () => {
+    // The request carries the content as of the click and success closes this
+    // same session, so an editable body let the user type a newer draft that
+    // the closing dialog then discarded without a word. editSeqRef separates
+    // sessions, not drafts inside one.
+    let releaseSave = () => {};
+    saveSkillMock.mockImplementation(
+      (name: string) =>
+        new Promise<{ ok: boolean; name: string }>((resolve) => {
+          releaseSave = () => resolve({ ok: true, name });
+        }),
+    );
+
+    renderPane();
+    await screen.findByText("alpha");
+    fireEvent.click(editButtons()[0]);
+    const body = await screen.findByDisplayValue("alpha original body");
+
+    // Positive control: real keystrokes do land before the save starts, so
+    // the no-op below is the freeze and not a harness that cannot type.
+    await focusAndType(body, " drafted");
+    expect(body).toHaveDisplayValue("alpha original body drafted");
+
+    await act(async () => {
+      clickDialogButton(zh.common.save);
+    });
+    expect(saveSkillMock).toHaveBeenCalledWith(
+      "alpha",
+      "alpha original body drafted",
+      true,
+    );
+
+    expect(body).toHaveAttribute("readonly");
+    expect(
+      within(screen.getByRole("dialog")).getByRole("switch"),
+    ).toBeDisabled();
+    await focusAndType(body, " then lost");
+    expect(body).toHaveDisplayValue("alpha original body drafted");
+
+    await act(async () => {
+      releaseSave();
+    });
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    // One submit, carrying exactly the draft that was on screen at the click:
+    // nothing typed afterwards was stored, and nothing was silently dropped.
+    expect(saveSkillMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("freezes the URL fields so a pending import cannot drop a retype", async () => {
+    // Same shape one dialog over: success closes this dialog and clears both
+    // fields, so a URL retyped during the wait would vanish the same way.
+    let releaseImport = () => {};
+    importUrlMock.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          releaseImport = () => resolve(importResult("hub-skill"));
+        }),
+    );
+
+    renderPane();
+    await screen.findByText("alpha");
+    await openUrlImportDialog();
+    const url = urlInput();
+
+    await focusAndType(url, "https://x");
+    expect(url).toHaveDisplayValue("https://x");
+    fireEvent.change(url, { target: { value: _URL_INPUT } });
+
+    await act(async () => {
+      clickDialogButton(zh.common.import);
+    });
+    expect(importUrlMock).toHaveBeenCalledWith(_URL_INPUT, "");
+
+    expect(url).toHaveAttribute("readonly");
+    expect(importNameInput()).toHaveAttribute("readonly");
+    await focusAndType(url, "lost");
+    expect(url).toHaveDisplayValue(_URL_INPUT);
+
+    await act(async () => {
+      releaseImport();
+    });
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(importUrlMock).toHaveBeenCalledTimes(1);
   });
 });

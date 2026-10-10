@@ -4,11 +4,14 @@
 
 from __future__ import annotations
 
+import io
 import json
 import threading
+import zipfile
 
 from fastapi import FastAPI
 import pytest
+from starlette.datastructures import UploadFile
 
 from api import skill_routes
 from api.dependencies import creator_error_handler
@@ -16,6 +19,7 @@ from domain.errors import CreatorError
 from models import config
 from qwenpaw.exceptions import SkillsError
 from services import external_skills
+from services.media_files import user_skills
 from services.skill_hub import (
     HubBundle,
     SkillHubTimeout,
@@ -466,3 +470,111 @@ def test_url_import_maps_fetch_failures_to_http_status(
         response.json(),
         ensure_ascii=False,
     )
+
+
+def test_upload_refuses_an_oversized_body_before_reading_it(
+    tmp_path,
+    monkeypatch,
+    api_request,
+) -> None:
+    """The declared length is enough to refuse: no spool, no parse.
+
+    ``request.form()`` spools the upload to a temporary file and ``read()``
+    then pulls it into memory, so the importer's own size check used to run
+    only after both had happened.
+    """
+
+    _configure(tmp_path, monkeypatch, [])
+    cap = 1024 * 1024
+    monkeypatch.setattr(skill_routes, "MAX_SKILL_ZIP_BYTES", cap)
+    monkeypatch.setattr(user_skills, "MAX_SKILL_ZIP_BYTES", cap)
+
+    def refuse(*_args, **_kwargs):
+        raise AssertionError("an over-limit body must not reach the importer")
+
+    monkeypatch.setattr(skill_routes, "import_skills_from_zip_bytes", refuse)
+    response = api_request(
+        _app(),
+        "POST",
+        "/skills/upload",
+        files={"file": ("skills.zip", b"z" * (cap + 1), "application/zip")},
+    )
+    assert response.status_code == 400
+    assert "ZIP 超过 1MB 上限" in json.dumps(
+        response.json(),
+        ensure_ascii=False,
+    )
+
+
+def test_upload_reads_at_most_one_byte_past_the_cap(
+    tmp_path,
+    monkeypatch,
+    api_request,
+) -> None:
+    """A chunked upload declares no length, so the read itself stays bounded.
+
+    Reading cap + 1 is enough to refuse while keeping an over-limit body out
+    of memory, and the importer re-checks because it is reachable without
+    this route.
+    """
+
+    data_root = _configure(tmp_path, monkeypatch, [])
+    monkeypatch.setattr(skill_routes, "MAX_SKILL_ZIP_BYTES", 4096)
+    sizes: list[int] = []
+    real_read = UploadFile.read
+
+    async def recording_read(self, size=-1):
+        sizes.append(size)
+        return await real_read(self, size)
+
+    monkeypatch.setattr(UploadFile, "read", recording_read)
+    payload = io.BytesIO()
+    with zipfile.ZipFile(payload, "w") as archive:
+        archive.writestr("demo/SKILL.md", _SKILL_MD)
+
+    response = api_request(
+        _app(),
+        "POST",
+        "/skills/upload",
+        files={
+            "file": (
+                "skills.zip",
+                payload.getvalue(),
+                "application/zip",
+            ),
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert sizes == [4097]
+    assert response.json()["imported"] == ["demo-skill"]
+    assert (data_root / "skills" / "demo-skill" / "SKILL.md").is_file()
+
+
+def test_save_route_refuses_an_oversized_document_without_writing(
+    tmp_path,
+    monkeypatch,
+    api_request,
+) -> None:
+    """The request schema bounds the name but not the body.
+
+    The document cap lives in the writer, so the editor save is bounded by the
+    same number as a ZIP member or a hub bundle instead of writing whatever
+    the client sent.
+    """
+
+    data_root = _configure(tmp_path, monkeypatch, [])
+    monkeypatch.setattr(user_skills, "_MAX_SKILL_DOC_BYTES", 2048)
+    response = api_request(
+        _app(),
+        "POST",
+        "/skills",
+        json={"name": "huge", "content": _SKILL_MD + "x" * 4096},
+    )
+    assert response.status_code == 400
+    assert "超过 2KB 上限" in json.dumps(
+        response.json(),
+        ensure_ascii=False,
+    )
+    assert not list((data_root / "skills").iterdir())
+    assert not config.load_skills_config()
