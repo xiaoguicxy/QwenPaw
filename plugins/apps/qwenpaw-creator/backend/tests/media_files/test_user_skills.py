@@ -130,6 +130,9 @@ def test_same_name_save_and_delete_never_register_a_fileless_skill(
     saver = threading.Thread(
         target=user_skills.save_user_skill,
         args=("demo", _skill_md("demo-v2")),
+        # A same-name save is an edit, the only path allowed to replace a
+        # registered skill's SKILL.md.
+        kwargs={"overwrite": True},
     )
     deleted: list[bool] = []
     deleter = threading.Thread(
@@ -159,6 +162,97 @@ def test_same_name_save_and_delete_never_register_a_fileless_skill(
             "delete interleaved between the SKILL.md write and the config "
             "registration, resurrecting 'demo' without its file"
         )
+
+
+def test_create_refuses_to_replace_an_existing_skill(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """A duplicate name on create must never rewrite another skill's file.
+
+    One endpoint serves both create and edit, so the request has to say which
+    it means: without that, typing an existing name in "Add skill" silently
+    replaced that skill's SKILL.md and its config entry.
+    """
+
+    data_root = _prepare(tmp_path, monkeypatch)
+    user_skills.save_user_skill("demo", _skill_md("demo"))
+    path = data_root / "skills" / "demo" / "SKILL.md"
+    original = path.read_text(encoding="utf-8")
+
+    with pytest.raises(user_skills.UserSkillError, match="已存在"):
+        user_skills.save_user_skill("demo", _skill_md("hijacked"))
+    assert path.read_text(encoding="utf-8") == original
+    assert {item.name for item in config.load_skills_config()} == {"demo"}
+
+    # Editing that very skill stays allowed: the UI fixes the name and says so.
+    entry = user_skills.save_user_skill(
+        "demo",
+        _skill_md("demo"),
+        overwrite=True,
+    )
+    assert entry.name == "demo"
+    assert path.read_text(encoding="utf-8") == original
+
+
+def test_create_refuses_to_replace_an_unregistered_skill_dir(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """Hand-authored content under the managed root survives a name clash.
+
+    Such a directory never reaches the config listing, so the panel cannot
+    offer to edit it -- a refused create is the only way to keep it.
+    """
+
+    data_root = _prepare(tmp_path, monkeypatch)
+    manual = data_root / "skills" / "legacy"
+    manual.mkdir(parents=True)
+    written = _skill_md("legacy")
+    (manual / "SKILL.md").write_text(written, encoding="utf-8")
+
+    with pytest.raises(user_skills.UserSkillError, match="已存在"):
+        user_skills.save_user_skill("legacy", _skill_md("legacy"))
+    assert (manual / "SKILL.md").read_text(encoding="utf-8") == written
+
+    # An empty leftover directory is not content, so it must not block a
+    # create: the save publishes with mkdir(exist_ok=True).
+    (data_root / "skills" / "fresh").mkdir()
+    assert user_skills.save_user_skill("fresh", _skill_md("fresh")).name
+
+
+def test_zip_import_skips_occupied_names_without_overwriting(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """An import replaces nothing, neither an installed skill nor itself.
+
+    Two members of one zip may share a front matter name; installing both
+    claimed two skills while keeping only the last SKILL.md.
+    """
+
+    data_root = _prepare(tmp_path, monkeypatch)
+    user_skills.save_user_skill("demo", _skill_md("demo"))
+    demo_md = data_root / "skills" / "demo" / "SKILL.md"
+    original = demo_md.read_text(encoding="utf-8")
+    payload = io.BytesIO()
+    with zipfile.ZipFile(payload, "w") as archive:
+        archive.writestr(
+            "demo/SKILL.md",
+            "---\nname: demo\ndescription: from-zip\n---\n\n# ZIP\n",
+        )
+        archive.writestr("one/SKILL.md", _skill_md("dup"))
+        archive.writestr("two/SKILL.md", _skill_md("dup"))
+        archive.writestr("three/SKILL.md", _skill_md("fresh"))
+
+    result = user_skills.import_skills_from_zip_bytes(payload.getvalue())
+
+    assert sorted(result["imported"]) == ["dup", "fresh"]
+    assert result["count"] == 2
+    assert [item["name"] for item in result["skipped"]] == ["demo", "two"]
+    assert demo_md.read_text(encoding="utf-8") == original
+    registered = {item.name for item in config.load_skills_config()}
+    assert registered == {"demo", "dup", "fresh"}
 
 
 def test_writes_refuse_to_drop_a_rejected_config_entry(
@@ -284,8 +378,13 @@ def test_create_refuses_to_shadow_a_builtin_skill(
     )
     config._clear_skills_config_cache()
     external_skills._clear_load_cache()
+    # A pre-existing same-name config entry keeps its documented override,
+    # but only through an explicit edit -- a create on that name is occupied.
+    with pytest.raises(user_skills.UserSkillError, match="已存在"):
+        user_skills.save_user_skill("visual-asset-design", _skill_md("mine"))
     entry = user_skills.save_user_skill(
         "visual-asset-design",
         _skill_md("mine"),
+        overwrite=True,
     )
     assert entry.name == "visual-asset-design"

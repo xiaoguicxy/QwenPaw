@@ -177,11 +177,13 @@ def test_save_skill_runs_off_the_event_loop(
 
     _configure(tmp_path, monkeypatch, [])
     save_threads: list[int] = []
+    save_overwrite: list[bool] = []
     real_save = skill_routes.save_user_skill
 
-    def recording_save(name, content):
+    def recording_save(name, content, *, overwrite=False):
         save_threads.append(threading.get_ident())
-        return real_save(name, content)
+        save_overwrite.append(overwrite)
+        return real_save(name, content, overwrite=overwrite)
 
     monkeypatch.setattr(skill_routes, "save_user_skill", recording_save)
 
@@ -192,6 +194,19 @@ def test_save_skill_runs_off_the_event_loop(
             json={"name": "demo-skill", "content": _SKILL_MD},
         )
         assert response.status_code == 200, response.text
+        # Absent flag means create, which must never replace a same-named
+        # skill; the edit states its intent explicitly.
+        assert save_overwrite == [False]
+        response = await client.post(
+            "/skills",
+            json={
+                "name": "demo-skill",
+                "content": _SKILL_MD,
+                "overwrite": True,
+            },
+        )
+        assert response.status_code == 200, response.text
+        assert save_overwrite == [False, True]
         return loop_thread
 
     loop_thread = run_scenario(_app(), scenario)
@@ -208,7 +223,7 @@ def test_refused_skill_write_surfaces_as_400(
 
     _configure(tmp_path, monkeypatch, [])
 
-    def refuse(name, content):
+    def refuse(name, content, *, overwrite=False):
         raise skill_routes.UserSkillError("技能名与内置技能同名: demo")
 
     monkeypatch.setattr(skill_routes, "save_user_skill", refuse)
@@ -220,3 +235,46 @@ def test_refused_skill_write_surfaces_as_400(
     )
     assert response.status_code == 400
     assert "内置" in json.dumps(response.json(), ensure_ascii=False)
+
+
+def test_duplicate_create_is_refused_through_the_route(
+    tmp_path,
+    monkeypatch,
+    api_request,
+) -> None:
+    """The create/edit intent survives the HTTP layer, not just the service.
+
+    A second POST without overwrite names a skill that is now registered, so
+    it must surface the 400 refusal instead of silently replacing the first.
+    """
+
+    _configure(tmp_path, monkeypatch, [])
+    app = _app()
+    created = api_request(
+        app,
+        "POST",
+        "/skills",
+        json={"name": "demo-skill", "content": _SKILL_MD},
+    )
+    assert created.status_code == 200, created.text
+
+    duplicate = api_request(
+        app,
+        "POST",
+        "/skills",
+        json={"name": "demo-skill", "content": _SKILL_MD},
+    )
+    assert duplicate.status_code == 400
+    assert "已存在" in json.dumps(duplicate.json(), ensure_ascii=False)
+
+    edited = api_request(
+        app,
+        "POST",
+        "/skills",
+        json={
+            "name": "demo-skill",
+            "content": _SKILL_MD,
+            "overwrite": True,
+        },
+    )
+    assert edited.status_code == 200, edited.text

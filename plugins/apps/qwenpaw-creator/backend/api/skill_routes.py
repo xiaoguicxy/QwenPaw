@@ -100,6 +100,10 @@ async def get_skill_content(name: str) -> dict[str, Any]:
 class SaveSkillRequest(BaseModel):
     name: str = Field(min_length=1, max_length=64)
     content: str = Field(min_length=1)
+    # Only the client knows which operation it means: the editor fixes the
+    # name when editing an existing skill and leaves it free when creating one,
+    # so creating must never be allowed to replace a same-named skill.
+    overwrite: bool = False
 
 
 @router.post("")
@@ -109,7 +113,11 @@ async def save_skill(request: SaveSkillRequest) -> dict[str, Any]:
     # for a lock held by a ZIP import worker would stall every other request.
     entry = await asyncio.to_thread(
         _data_root_guard,
-        lambda: save_user_skill(request.name.strip(), request.content),
+        lambda: save_user_skill(
+            request.name.strip(),
+            request.content,
+            overwrite=request.overwrite,
+        ),
     )
     return {"ok": True, "name": entry.name}
 

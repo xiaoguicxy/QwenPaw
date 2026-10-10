@@ -157,6 +157,10 @@ export default function SkillsConfigPane() {
       message.error(t("skills.nameInvalid"));
       return;
     }
+    if (nameTaken) {
+      message.error(t("skills.nameTaken"));
+      return;
+    }
     // Defense-in-depth, not a reachable flow: antd 6.5.0 returns early from
     // handleCancel while confirmLoading is set, so every cancel/close path is
     // blocked and the mask also covers the row actions. The captured sequence
@@ -166,7 +170,7 @@ export default function SkillsConfigPane() {
     const seq = editSeqRef.current;
     setSaving(true);
     try {
-      await saveSkill(skillName, content);
+      await saveSkill(skillName, content, editingName !== "");
       message.success(t("skills.saveSuccess"));
       if (seq === editSeqRef.current) {
         setEditorOpen(false);
@@ -250,6 +254,12 @@ export default function SkillsConfigPane() {
 
   const nameInvalid =
     !editingName && name.trim().length > 0 && !SKILL_NAME_RE.test(name.trim());
+  // Creating on an occupied name would replace that skill's SKILL.md; the
+  // backend refuses it, so block the submit here and say why up front.
+  const nameTaken =
+    !editingName &&
+    SKILL_NAME_RE.test(name.trim()) &&
+    items.some((item) => item.name === name.trim());
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
@@ -446,7 +456,7 @@ export default function SkillsConfigPane() {
         cancelText={previewMode ? t("common.close") : t("common.cancel")}
         okButtonProps={{
           style: previewMode ? { display: "none" } : undefined,
-          disabled: truncated,
+          disabled: truncated || nameTaken,
         }}
         confirmLoading={saving}
         onOk={handleSave}
@@ -460,7 +470,7 @@ export default function SkillsConfigPane() {
               <Input
                 value={name}
                 disabled={!!editingName}
-                status={nameInvalid ? "error" : undefined}
+                status={nameInvalid || nameTaken ? "error" : undefined}
                 placeholder="my-video-editing-skill"
                 onChange={(event) => setName(event.target.value)}
               />
@@ -470,12 +480,17 @@ export default function SkillsConfigPane() {
                     fontSize: 11,
                     marginTop: 4,
                     lineHeight: 1.5,
-                    color: nameInvalid
-                      ? "var(--color-error)"
-                      : "var(--color-text-tertiary)",
+                    color:
+                      nameInvalid || nameTaken
+                        ? "var(--color-error)"
+                        : "var(--color-text-tertiary)",
                   }}
                 >
-                  {nameInvalid ? t("skills.nameInvalid") : t("skills.nameRule")}
+                  {nameInvalid
+                    ? t("skills.nameInvalid")
+                    : nameTaken
+                    ? t("skills.nameTaken")
+                    : t("skills.nameRule")}
                 </div>
               )}
             </div>

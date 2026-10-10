@@ -79,6 +79,21 @@ function clickDialogButton(label: string): void {
   );
 }
 
+function saveButton(): HTMLElement {
+  const name = new RegExp(zh.common.save.split("").join("\\s*"));
+  return within(screen.getByRole("dialog")).getByRole("button", { name });
+}
+
+/** Open the create dialog through the "Add skill" dropdown. */
+async function openCreateDialog(): Promise<void> {
+  fireEvent.click(screen.getByRole("button", { name: zh.skills.add }));
+  const item = await screen.findByRole("menuitem", {
+    name: zh.skills.newSkill,
+  });
+  fireEvent.click(item);
+  await screen.findByRole("dialog");
+}
+
 describe("SkillsConfigPane editor session guard", () => {
   beforeEach(() => {
     listSkillsMock.mockResolvedValue({
@@ -112,7 +127,11 @@ describe("SkillsConfigPane editor session guard", () => {
     await act(async () => {
       clickDialogButton(zh.common.save);
     });
-    expect(saveSkillMock).toHaveBeenCalledWith("alpha", "alpha original body");
+    expect(saveSkillMock).toHaveBeenCalledWith(
+      "alpha",
+      "alpha original body",
+      true,
+    );
 
     // While alpha's save is still in flight, move the editor to beta and make
     // an unsaved edit. antd 6.5.0 blocks every cancel/close path during
@@ -151,6 +170,64 @@ describe("SkillsConfigPane editor session guard", () => {
     });
 
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
-    expect(saveSkillMock).toHaveBeenCalledWith("alpha", "alpha original body");
+    expect(saveSkillMock).toHaveBeenCalledWith(
+      "alpha",
+      "alpha original body",
+      true,
+    );
+  });
+});
+
+describe("SkillsConfigPane duplicate skill name", () => {
+  beforeEach(() => {
+    // Vitest keeps call history across cases in a file, and this case asserts
+    // a save that never happens.
+    saveSkillMock.mockReset();
+    listSkillsMock.mockResolvedValue({
+      items: [skillItem("alpha"), skillItem("beta")],
+    });
+    getSkillContentMock.mockImplementation((name: string) =>
+      Promise.resolve(skillContent(name)),
+    );
+  });
+
+  it("refuses to create a skill on a name that already exists", async () => {
+    // The backend is the authority, but the panel must not even offer the
+    // destructive submit: a create on an occupied name would replace the
+    // SKILL.md of the skill that already owns it.
+    saveSkillMock.mockResolvedValue({ ok: true, name: "alpha" });
+
+    renderPane();
+    await screen.findByText("alpha");
+
+    await openCreateDialog();
+    fireEvent.change(screen.getByPlaceholderText("my-video-editing-skill"), {
+      target: { value: "alpha" },
+    });
+
+    // toBeInTheDocument rather than toBeVisible: rc-motion keeps a freshly
+    // opened dialog at opacity 0 under jsdom, and toBeVisible walks ancestor
+    // opacity. The disabled save below is the part that must hold.
+    expect(await screen.findByText(zh.skills.nameTaken)).toBeInTheDocument();
+    expect(saveButton()).toBeDisabled();
+    await act(async () => {
+      clickDialogButton(zh.common.save);
+    });
+    expect(saveSkillMock).not.toHaveBeenCalled();
+
+    // A free name stays an ordinary create: no warning, no overwrite intent.
+    fireEvent.change(screen.getByPlaceholderText("my-video-editing-skill"), {
+      target: { value: "gamma" },
+    });
+    expect(screen.queryByText(zh.skills.nameTaken)).toBeNull();
+    expect(saveButton()).toBeEnabled();
+    await act(async () => {
+      clickDialogButton(zh.common.save);
+    });
+    expect(saveSkillMock).toHaveBeenCalledWith(
+      "gamma",
+      expect.any(String),
+      false,
+    );
   });
 });

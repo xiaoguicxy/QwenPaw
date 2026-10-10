@@ -121,8 +121,39 @@ def _validated_dir(name: str) -> Path:
     return _skills_root() / name
 
 
-def save_user_skill(name: str, content: str) -> SkillEntry:
-    """Write SKILL.md content and register/refresh its config entry."""
+def _managed_skill_names() -> set[str]:
+    """Names already occupied under the managed skills root.
+
+    Includes directories holding a hand-authored SKILL.md that never made it
+    into the config: that content is invisible to the panel and unrecoverable
+    once a duplicate create replaces it.
+    """
+
+    try:
+        return {
+            path.name
+            for path in _skills_root().iterdir()
+            if (path / "SKILL.md").is_file()
+        }
+    except OSError:
+        return set()
+
+
+def save_user_skill(
+    name: str,
+    content: str,
+    *,
+    overwrite: bool = False,
+) -> SkillEntry:
+    """Write SKILL.md content and register/refresh its config entry.
+
+    ``overwrite`` states the caller's intent, which the endpoint cannot
+    recover on its own: the name is a skill's only identity, so a create that
+    lands on an occupied name silently replaces the SKILL.md (and the entry)
+    of the skill already living there. The UI fixes the name while editing an
+    existing skill and leaves it free while creating one, so it passes True
+    for the former and gets refused for the latter.
+    """
 
     directory = _validated_dir(name)
     try:
@@ -142,6 +173,16 @@ def save_user_skill(name: str, content: str) -> SkillEntry:
             # read-only and would then hide the original content.
             raise UserSkillError(
                 f"技能名与内置技能同名，保存将覆盖内置内容: {name}",
+            )
+        if not overwrite and (
+            existing is not None or (directory / "SKILL.md").is_file()
+        ):
+            # Either occupant counts: a registered entry means the panel was
+            # showing that skill (editing it is the overwrite=True path), and
+            # an unregistered SKILL.md means hand-authored content that no
+            # listing would ever reveal before it got destroyed.
+            raise UserSkillError(
+                f"技能名已存在: {name}；如需修改请在技能列表中编辑该技能",
             )
         # Publish SKILL.md and register the entry in one critical section so
         # a concurrent delete cannot remove the directory in between and leave
@@ -194,8 +235,9 @@ def import_skills_from_zip_bytes(data: bytes) -> dict:
     Reuses the Project archive extractor, so zip-slip, symlink and
     expansion-bomb members are rejected before anything touches disk. A
     zip may carry a single skill (SKILL.md at the root) or several (one
-    directory each). Builtin-name collisions and invalid skills are
-    skipped and reported rather than aborting the whole import.
+    directory each). Builtin-name collisions, names that an existing skill
+    already occupies and invalid skills are skipped and reported rather than
+    overwriting anything or aborting the whole import.
     """
 
     if len(data) > _MAX_ZIP_BYTES:
@@ -208,6 +250,12 @@ def import_skills_from_zip_bytes(data: bytes) -> dict:
     imported: list[str] = []
     skipped: list[dict] = []
     builtin = _builtin_skill_names()
+    # Snapshot of the names an import may not replace. The strict create below
+    # stays the authoritative guard (this races a concurrent save); the check
+    # here only turns an expected collision into a clean reported skip instead
+    # of a logged traceback for an ordinary business refusal.
+    occupied = {item.name for item in load_skills_config()}
+    occupied |= _managed_skill_names()
     with tempfile.TemporaryDirectory(prefix="creator-skill-") as tmp:
         extract_dir = Path(tmp) / "extract"
         extract_dir.mkdir(mode=0o700)
@@ -247,8 +295,19 @@ def import_skills_from_zip_bytes(data: bytes) -> dict:
                         {"name": name, "reason": "与内置技能同名"},
                     )
                     continue
+                if name in occupied:
+                    # Covers a skill the data root already has and a second
+                    # member reusing a name installed earlier in this zip.
+                    skipped.append(
+                        {
+                            "name": label,
+                            "reason": f"技能名 {name} 已存在，未覆盖",
+                        },
+                    )
+                    continue
                 save_user_skill(name, content)
                 imported.append(name)
+                occupied.add(name)
             except Exception as exc:
                 # One bad member must never abort the batch: parse_skill_md
                 # re-raises PyYAML errors (ParserError/ScannerError) which are
