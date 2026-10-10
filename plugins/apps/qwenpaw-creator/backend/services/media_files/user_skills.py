@@ -30,6 +30,7 @@ from services.external_skills import (
     parse_skill_md,
 )
 from services.runtime_files.atomic_store import atomic_replace_bytes
+from services.skill_hub import HubBundle
 from services.storage_root import require_creator_data_root
 from utils.logger import setup_logger
 
@@ -331,6 +332,55 @@ def import_skills_from_zip_bytes(data: bytes) -> dict:
     return {"imported": imported, "skipped": skipped, "count": len(imported)}
 
 
+def _hub_skill_name(remote: str) -> tuple[str, str | None]:
+    """Map a hub skill name onto the managed naming rule.
+
+    A market name is display text, not an identifier: ``Excel / XLSX`` and
+    ``My Skill`` both arrive from real bundles, while a skill directory must
+    be a lowercase slug. Rather than refusing the import, fold it the way the
+    host folds its own names and report the original so the caller can say
+    which name landed. Nothing here can silently land on an occupied name:
+    the strict ``save_user_skill`` create below still decides that.
+    """
+
+    if _NAME_RE.match(remote):
+        return remote, None
+    slug = re.sub(r"[^a-z0-9]+", "-", remote.lower()).strip("-")
+    if _NAME_RE.match(slug):
+        return slug, remote or None
+    raise UserSkillError(
+        f"远端技能名不合规，无法用作技能标识: {remote or '(空)'}；" "请自行填写技能名后重试",
+    )
+
+
+def install_skill_from_hub_bundle(bundle: HubBundle) -> dict:
+    """Register a hub-fetched bundle as a user skill (SKILL.md only).
+
+    Mirrors ``import_skills_from_zip_bytes`` in what it promises: only
+    SKILL.md reaches the data root, and an occupied name is refused instead
+    of replaced. The difference is that a one-skill import reports its
+    failure as an error rather than a skipped member, because the caller
+    asked for exactly this skill.
+    """
+
+    name, renamed_from = _hub_skill_name((bundle.name or "").strip())
+    # The SKILL.md text is the whole product: Creator's loader reads only
+    # SKILL.md and a skill is granted no capability beyond that text, so the
+    # bundle's references/scripts/extra_files are counted and reported
+    # instead of being written next to it.
+    entry = save_user_skill(name, bundle.content)
+    return {
+        "imported": [entry.name],
+        "skipped": [],
+        "count": 1,
+        "name": entry.name,
+        "renamed_from": renamed_from,
+        "source_url": bundle.source_url,
+        "installed_from": bundle.installed_from,
+        "ignored_files": bundle.ignored_files,
+    }
+
+
 def set_user_skill_enabled(name: str, enabled: bool) -> bool:
     """Toggle a configured (non-builtin) skill; report whether it changed."""
 
@@ -369,6 +419,7 @@ __all__ = [
     "UserSkillError",
     "delete_user_skill",
     "import_skills_from_zip_bytes",
+    "install_skill_from_hub_bundle",
     "save_user_skill",
     "set_user_skill_enabled",
 ]

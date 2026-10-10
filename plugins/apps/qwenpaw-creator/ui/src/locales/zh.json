@@ -34,7 +34,19 @@
     "uploadSuccess": "导入成功",
     "uploadNoSkill": "ZIP 中未找到有效技能（需包含 SKILL.md）",
     "uploadSkipped": "已跳过",
-    "uploadFailed": "导入失败"
+    "uploadFailed": "导入失败",
+    "importUrl": "从 URL 导入",
+    "importUrlTitle": "从技能市场 URL 导入",
+    "importUrlLabel": "技能 URL",
+    "urlInvalid": "请填写以 http:// 或 https:// 开头的 URL",
+    "importUrlNameLabel": "技能名（可选）",
+    "importUrlNamePlaceholder": "留空则使用远端技能名",
+    "importUrlNameHint": "留空则取远端包里声明的技能名；不合规的远端名称会被转为小写 slug。导入不会覆盖同名技能。",
+    "importUrlHint": "与技能池一致，支持 QwenPaw 技能平台、skills.sh、GitHub、ClawHub、LobeHub、ModelScope、SkillsMP 等市场的技能页 URL；只取 SKILL.md 正文作为领域知识。",
+    "importUrlSuccess": "已从 URL 导入",
+    "importUrlRenamed": "远端技能名不合规，已改为：{{from}} → {{to}}",
+    "importUrlIgnored": "已忽略 {{count}} 个附属文件（技能只使用 SKILL.md 正文）",
+    "importUrlFailed": "URL 导入失败"
   },
   "common": {
     "close": "关闭",

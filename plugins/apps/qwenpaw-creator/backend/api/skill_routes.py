@@ -1,4 +1,7 @@
 # -*- coding: utf-8 -*-
+# The host runtime is a plain third-party dependency of this plugin; pylint
+# resolves it as first-party from the repo root; the order check is off.
+# pylint: disable=wrong-import-order
 """Skill listing, content view, save, toggle and delete endpoints.
 
 Backs the "Skills" pane of the model-configuration modal. User skills are
@@ -13,6 +16,7 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
+from qwenpaw.exceptions import AppBaseException
 from starlette.datastructures import UploadFile
 
 from services.external_skills import (
@@ -27,8 +31,15 @@ from services.media_files.user_skills import (
     UserSkillError,
     delete_user_skill,
     import_skills_from_zip_bytes,
+    install_skill_from_hub_bundle,
     save_user_skill,
     set_user_skill_enabled,
+)
+from services.skill_hub import (
+    SkillHubTimeout,
+    SkillHubUnavailable,
+    SkillHubUrlError,
+    fetch_skill_bundle,
 )
 from services.storage_root import CreatorDataRootError
 
@@ -144,6 +155,54 @@ async def upload_skill_zip(request: Request) -> dict[str, Any]:
     return await asyncio.to_thread(
         _data_root_guard,
         lambda: import_skills_from_zip_bytes(data),
+    )
+
+
+class ImportSkillUrlRequest(BaseModel):
+    bundle_url: str = Field(min_length=1, max_length=2048)
+    # Pins the skill name instead of inheriting whatever the remote bundle
+    # declares, mirroring the Pool's own target_name escape hatch.
+    target_name: str | None = Field(default=None, max_length=64)
+    version: str = Field(default="", max_length=64)
+
+
+@router.post("/import-url")
+async def import_skill_from_url(
+    request: ImportSkillUrlRequest,
+) -> dict[str, Any]:
+    """Import one skill from a Skills Hub URL, as the Skill Pool does.
+
+    Only the write is Creator's. Routing the URL to its market, fetching and
+    capping the package and sanitising its paths all stay in the host, so a
+    hub import lands on exactly the same strict create that refuses a
+    duplicate name for a hand-authored skill.
+    """
+
+    target = (request.target_name or "").strip() or None
+    try:
+        bundle = await fetch_skill_bundle(
+            request.bundle_url,
+            version=request.version,
+            target_name=target,
+        )
+    except SkillHubUrlError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except SkillHubUnavailable as exc:
+        raise HTTPException(status_code=501, detail=str(exc)) from exc
+    except SkillHubTimeout as exc:
+        raise HTTPException(status_code=504, detail=str(exc)) from exc
+    except (ValueError, AppBaseException) as exc:
+        # The host reports a bad URL, an unreachable market or an unusable
+        # bundle through these, the same pair its own Pool route maps to 400.
+        raise HTTPException(
+            status_code=400,
+            detail=f"从 URL 导入失败：{exc}",
+        ) from exc
+    # Off the event loop like every other writer here: this takes the
+    # module-wide skills_config lock and does blocking disk IO.
+    return await asyncio.to_thread(
+        _data_root_guard,
+        lambda: install_skill_from_hub_bundle(bundle),
     )
 
 

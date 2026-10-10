@@ -15,6 +15,7 @@ import pytest
 from models import config
 from services import external_skills
 from services.media_files import user_skills
+from services.skill_hub import HubBundle
 
 pytestmark = pytest.mark.unit
 
@@ -388,3 +389,77 @@ def test_create_refuses_to_shadow_a_builtin_skill(
         overwrite=True,
     )
     assert entry.name == "visual-asset-design"
+
+
+def _hub_bundle(name: str, content: str | None = None, ignored: int = 0):
+    return HubBundle(
+        name=name,
+        content=content if content is not None else _skill_md(name),
+        source_url="https://clawhub.ai/acme/skills/" + name,
+        installed_from="clawhub",
+        ignored_files=ignored,
+    )
+
+
+def test_hub_import_folds_a_display_name_into_a_slug(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """Market names are display text; the directory still must be a slug.
+
+    Folding it keeps the import usable instead of refusing a good bundle, and
+    reporting the original keeps the user from hunting for a skill that was
+    never installed under the name they read on the market page.
+    """
+
+    data_root = _prepare(tmp_path, monkeypatch)
+    result = user_skills.install_skill_from_hub_bundle(
+        _hub_bundle("Excel / XLSX", ignored=7),
+    )
+    assert result["name"] == "excel-xlsx"
+    assert result["renamed_from"] == "Excel / XLSX"
+    assert result["ignored_files"] == 7
+    assert (data_root / "skills" / "excel-xlsx" / "SKILL.md").is_file()
+    assert [item.name for item in config.load_skills_config()] == [
+        "excel-xlsx",
+    ]
+
+
+def test_hub_import_refuses_an_unusable_remote_name(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """No slug can be folded out of a non-latin name: ask for one instead."""
+
+    _prepare(tmp_path, monkeypatch)
+    with pytest.raises(user_skills.UserSkillError, match="技能名"):
+        user_skills.install_skill_from_hub_bundle(_hub_bundle("数据中心"))
+    assert not config.load_skills_config()
+
+
+def test_hub_import_never_replaces_an_existing_skill(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """The hub path shares the create rule: an owned name is refused.
+
+    The second bundle is valid and different, so the first SKILL.md keeping
+    its bytes proves the refusal is the duplicate rule, not a parse failure.
+    """
+
+    data_root = _prepare(tmp_path, monkeypatch)
+    user_skills.install_skill_from_hub_bundle(_hub_bundle("hub-skill"))
+    original = (data_root / "skills" / "hub-skill" / "SKILL.md").read_text(
+        encoding="utf-8",
+    )
+
+    with pytest.raises(user_skills.UserSkillError, match="已存在"):
+        user_skills.install_skill_from_hub_bundle(
+            _hub_bundle(
+                "hub-skill",
+                content=_skill_md("hub-skill") + "## x\n",
+            ),
+        )
+    assert (data_root / "skills" / "hub-skill" / "SKILL.md").read_text(
+        encoding="utf-8",
+    ) == original
