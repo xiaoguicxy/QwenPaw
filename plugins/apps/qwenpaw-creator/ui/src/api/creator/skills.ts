@@ -29,10 +29,14 @@ export function getSkillContent(name: string): Promise<SkillContent> {
 export function saveSkill(
   name: string,
   content: string,
+  // Replaces an existing same-named skill when true. Creating a skill must
+  // leave it false: the backend then refuses a duplicate name instead of
+  // overwriting the skill that already owns it.
+  overwrite = false,
 ): Promise<{ ok: boolean; name: string }> {
   return creatorRequest<{ ok: boolean; name: string }>("/skills", {
     method: "POST",
-    body: jsonBody({ name, content }),
+    body: jsonBody({ name, content, overwrite }),
   });
 }
 
