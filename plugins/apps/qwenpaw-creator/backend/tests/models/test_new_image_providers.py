@@ -339,7 +339,9 @@ def test_minimax_decode_url_base64_and_base_resp(monkeypatch) -> None:
         return "/generated/img.png"
 
     monkeypatch.setattr(
-        minimax_provider, "download_remote_image", fake_download
+        minimax_provider,
+        "download_remote_image",
+        fake_download,
     )
     result = asyncio.run(
         model._decode({"data": {"image_urls": ["https://cdn/x.png"]}}),
