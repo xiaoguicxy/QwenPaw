@@ -58,6 +58,7 @@ from services.runtime_files.models import (
     SyncStatus,
 )
 
+from .blobs import ContentBlobStore, write_document_ref
 from .json_pointer import (
     MISSING,
     JsonCasConflict,
@@ -491,17 +492,22 @@ class ProjectCommitBoundary:
                 f"{transaction_id}.{uuid4().hex}"
             )
             staged_transaction.mkdir(mode=0o700)
+            blob_store = ContentBlobStore(runtime_root)
             try:
                 AtomicJsonRecordStore(
                     staged_transaction / "round.json",
                     ChangeRoundRecord,
                 ).write(round_record)
-                AtomicJsonRecordStore(staged_transaction / "base.json").write(
+                write_document_ref(
+                    blob_store,
+                    staged_transaction / "base.json",
                     base_data,
                 )
-                AtomicJsonRecordStore(
+                write_document_ref(
+                    blob_store,
                     staged_transaction / "candidate.json",
-                ).write(candidate_data)
+                    candidate_data,
+                )
                 AtomicJsonRecordStore(
                     staged_transaction / "journal.json",
                     ProjectCommitJournal,
@@ -673,14 +679,14 @@ class ProjectCommitBoundary:
                     final_data = _json(final_project)
                     pre_publish_etag = latest.etag
                     expected_final_etag = project_etag(final_project)
-                    AtomicJsonRecordStore(
+                    write_document_ref(
+                        blob_store,
                         transaction_root / "latest.json",
-                    ).write(
                         latest_data,
                     )
-                    AtomicJsonRecordStore(
+                    write_document_ref(
+                        blob_store,
                         transaction_root / "final.json",
-                    ).write(
                         final_data,
                     )
                     journal = journal.model_copy(
@@ -1158,10 +1164,15 @@ class ProjectCommitBoundary:
         # not advance Project generation.  An HTTP idempotency retry may occur
         # after unrelated later commits, so consulting the then-current
         # authority would not be enough to reconstruct the original result.
-        AtomicJsonRecordStore(transaction_root / "latest.json").write(
+        blob_store = ContentBlobStore(runtime_root)
+        write_document_ref(
+            blob_store,
+            transaction_root / "latest.json",
             latest_data,
         )
-        AtomicJsonRecordStore(transaction_root / "final.json").write(
+        write_document_ref(
+            blob_store,
+            transaction_root / "final.json",
             latest_data,
         )
         journal = journal.model_copy(

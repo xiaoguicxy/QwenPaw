@@ -33,6 +33,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import time
 from typing import Any, Protocol, TYPE_CHECKING
 from uuid import NAMESPACE_URL, uuid5
 
@@ -191,6 +192,27 @@ _SEGMENT_CACHE_MAX_ITEMS = 96
 # Renderer behaviour version for cached segments; bump on any semantic
 # change to segment rendering or overlay burning.
 _SEGMENT_CACHE_VERSION = 3
+
+
+def _link_or_copy(source: Path, destination: Path) -> None:
+    """Hard-link one immutable segment file, falling back to a byte copy.
+
+    Rendered segments never change after they are written, so the scratch
+    copy and the temp-dir cache entry can share one inode instead of
+    storing the bytes twice.  A cross-device cache (EXDEV), a filesystem
+    that refuses hard links or an existing destination degrades to
+    ``copy2``, which keeps the previous behaviour exactly.
+    """
+
+    link_kwargs = (
+        {"follow_symlinks": False}
+        if os.link in os.supports_follow_symlinks
+        else {}
+    )
+    try:
+        os.link(source, destination, **link_kwargs)
+    except OSError:
+        shutil.copy2(source, destination)
 
 
 @dataclass(frozen=True, slots=True)
@@ -401,6 +423,10 @@ class FfmpegLocalMediaRunner:
         if not spec.inputs:
             raise ValidationError("本地媒体执行至少需要一个输入")
         concat_inputs: list[Path] = []
+        rendered_segments: list[Path] = []
+        # Only the compose branch renders segments; it stays None in the
+        # passthrough branch, which never populates rendered_segments.
+        segment_dir: Path | None = None
         segment_durations: list[float] = []
         overlay_warnings: list[str] = []
         input_element_ids = tuple(
@@ -495,9 +521,12 @@ class FfmpegLocalMediaRunner:
             for index in range(len(spec.inputs)):
                 outcome = outcomes[index]
                 concat_inputs.append(outcome.path)
+                rendered_segments.append(outcome.path)
                 segment_durations.append(outcome.duration)
                 overlay_warnings.extend(outcome.warnings)
         else:
+            # Direct passthrough: these are caller-owned inputs, never
+            # this task's render products, so they are never deleted here.
             concat_inputs.extend(item.path for item in spec.inputs)
         joins = self._resolve_segment_joins(spec, joins_by_pair)
         if any(join.effective_blend() > 0 for join in joins) and len(
@@ -517,6 +546,18 @@ class FfmpegLocalMediaRunner:
                 spec.output_path,
                 work_dir=spec.work_dir,
             )
+        # Peak-scratch trim: concat succeeded, so this task's rendered
+        # segments are dead weight for the rest of the pipeline (mix/grade/
+        # loudness all read spec.output_path only). Deleting them drops the
+        # post-processed peak from ~3F to ~2F (F = final video size). Failure
+        # semantics: any failure *before* this point raises with all segments
+        # intact for forensics; after this point the merged output still
+        # exists, and the segment-cache hard links (P1) retain the per-segment
+        # content. Only this task's render products are removed.
+        for segment_path in rendered_segments:
+            segment_path.unlink(missing_ok=True)
+        if rendered_segments and segment_dir is not None:
+            _fsync_directory(segment_dir)
         if spec.audio_tracks:
             self._mix_audio_tracks(spec)
         grade_warning = self._apply_color_grade(spec)
@@ -1177,14 +1218,14 @@ class FfmpegLocalMediaRunner:
         cache_key: str,
         segment: Path,
     ) -> tuple[str, ...] | None:
-        """Copy one cached segment into place; returns its warnings."""
+        """Link (or copy) one cached segment into place; returns warnings."""
 
         entry = self._segment_cache_root() / f"{cache_key}.mp4"
         sidecar = entry.with_suffix(".json")
         if not entry.is_file():
             return None
         try:
-            shutil.copy2(entry, segment)
+            _link_or_copy(entry, segment)
             warnings: tuple[str, ...] = ()
             if sidecar.is_file():
                 data = json.loads(sidecar.read_text(encoding="utf-8"))
@@ -1204,7 +1245,7 @@ class FfmpegLocalMediaRunner:
         entry = root / f"{cache_key}.mp4"
         try:
             staged = entry.with_name(f"{entry.stem}.{os.getpid()}.tmp")
-            shutil.copy2(segment, staged)
+            _link_or_copy(segment, staged)
             staged.replace(entry)
             entry.with_suffix(".json").write_text(
                 json.dumps({"warnings": list(warnings)}),
@@ -2512,6 +2553,126 @@ def _ensure_real_directory_chain(root: Path, *segments: str) -> Path:
         _require_real_directory(child)
         current = child
     return current
+
+
+def _fsync_directory(directory: Path) -> None:
+    """Best-effort fsync one directory so unlinks survive a crash.
+
+    Scratch cleanup is advisory (the whole task tree is removed at terminal
+    state anyway), so platforms without directory fds simply skip it.
+    """
+
+    try:
+        handle = os.open(directory, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(handle)
+    except OSError:
+        pass
+    finally:
+        os.close(handle)
+
+
+def _materialize_indexed_input(
+    file_store: AssetFileStore,
+    indexed: IndexedFile,
+    destination: Path,
+) -> None:
+    """Link one indexed input into task scratch; copy only when linking cannot.
+
+    Execution inputs stay read-only for the whole run, so a hard link keeps
+    the scratch byte-free while ``link_verified`` still proves the content
+    through the linked fd.  Cross-device or link-less filesystems fall back
+    to the original verified stream copy.
+    """
+
+    try:
+        file_store.link_verified(indexed, destination)
+        return
+    except FileExistsError as exc:
+        raise StorageIntegrityError("Task input scratch 已存在") from exc
+    except OSError:
+        pass
+    with (
+        file_store.open_verified(indexed) as source,
+        destination.open("xb") as target,
+    ):
+        shutil.copyfileobj(source, target, length=1024 * 1024)
+        target.flush()
+        os.fsync(target.fileno())
+
+
+_TASK_SCRATCH_TERMINAL_GRACE_SECONDS = 10 * 60.0
+
+
+def _reclaim_task_scratch(project_root: Path, task_id: str) -> bool:
+    """Delete one task's scratch tree without ever escaping the Project."""
+
+    runtime_root = (project_root / "runtime").resolve(strict=False)
+    scratch_root = (runtime_root / "task-work").resolve(strict=False)
+    if scratch_root.parent != runtime_root or not scratch_root.is_dir():
+        return False
+    leaf = Path(task_id)
+    if not task_id or leaf.name != task_id or task_id in {".", ".."}:
+        return False
+    cleanup_path = scratch_root / task_id
+    resolved = cleanup_path.resolve(strict=False)
+    if resolved == scratch_root or not resolved.is_relative_to(scratch_root):
+        return False
+    if is_link_path(cleanup_path):
+        # rmtree must never follow a link planted inside the scratch root.
+        return False
+    shutil.rmtree(cleanup_path, ignore_errors=True)
+    return not cleanup_path.exists()
+
+
+def reclaim_terminal_task_scratch(
+    services: CreatorFileServices,
+    project_id: str,
+    *,
+    grace_seconds: float = _TASK_SCRATCH_TERMINAL_GRACE_SECONDS,
+) -> int:
+    """Reclaim scratch trees whose tasks converged or were cancelled.
+
+    Only directories strictly below ``<project>/runtime/task-work`` whose
+    task record is SUCCEEDED or CANCELLED are removed, and only after their
+    mtime aged past the grace window so a worker still winding down keeps
+    its fds.  QUARANTINED and FAILED scratch stays as rejection/forensic
+    evidence, including any asset index reference it may still hold.
+    """
+
+    project_root = services.projects.project_root(project_id)
+    scratch_root = project_root / "runtime" / "task-work"
+    if is_link_path(scratch_root) or not scratch_root.is_dir():
+        return 0
+    executions = ProjectExecutionStore(services.root)
+    cutoff = time.time() - grace_seconds
+    reclaimed = 0
+    for entry in sorted(scratch_root.iterdir()):
+        if is_link_path(entry) or not entry.is_dir():
+            continue
+        try:
+            aged = entry.stat().st_mtime <= cutoff
+        except OSError:
+            continue
+        if not aged:
+            continue
+        try:
+            task = executions.get_task(project_id, entry.name)
+        except RecordNotFoundError:
+            continue
+        if task.status not in {TaskStatus.SUCCEEDED, TaskStatus.CANCELLED}:
+            continue
+        if _reclaim_task_scratch(project_root, entry.name):
+            reclaimed += 1
+            logger.info(
+                "reclaimed terminal task scratch: project=%s task=%s status=%s",
+                _log_safe(project_id),
+                _log_safe(entry.name),
+                task.status.value,
+            )
+    return reclaimed
 
 
 def _indexed_version(
@@ -4190,13 +4351,11 @@ class FileLocalMediaExecutionService:
                 if destination.exists():
                     raise StorageIntegrityError("Task input scratch 已存在")
                 if frozen.indexed is not None:
-                    with (
-                        file_store.open_verified(frozen.indexed) as source,
-                        destination.open("xb") as target,
-                    ):
-                        shutil.copyfileobj(source, target, length=1024 * 1024)
-                        target.flush()
-                        os.fsync(target.fileno())
+                    _materialize_indexed_input(
+                        file_store,
+                        frozen.indexed,
+                        destination,
+                    )
                 elif frozen.source_url is not None:
                     source_version = (
                         base.project.assets.source_versions_by_id.get(
@@ -4287,13 +4446,11 @@ class FileLocalMediaExecutionService:
             if destination.exists():
                 raise StorageIntegrityError("Task audio scratch 已存在")
             if track.indexed is not None:
-                with (
-                    file_store.open_verified(track.indexed) as source,
-                    destination.open("xb") as target,
-                ):
-                    shutil.copyfileobj(source, target, length=1024 * 1024)
-                    target.flush()
-                    os.fsync(target.fileno())
+                _materialize_indexed_input(
+                    file_store,
+                    track.indexed,
+                    destination,
+                )
             elif track.source_url is not None:
                 download_remote_file(track.source_url, str(destination))
             else:
@@ -4436,11 +4593,14 @@ class FileLocalMediaExecutionService:
         file_store = AssetFileStore(
             self.services.projects.project_root(base.project.project_id),
         )
-        with spec.output_path.open("rb") as stream:
-            staged = file_store.stage_stream(
-                stream,
-                staging_id=task.task_id[:80],
-            )
+        # Zero-copy handoff: hard-link the render output into Asset staging
+        # and consume the scratch entry, so the published inode has a single
+        # owner and no second full-size copy ever hits the disk.
+        staged = file_store.stage_path(
+            spec.output_path,
+            staging_id=task.task_id[:80],
+            consume_source=True,
+        )
         relative_uri = PurePosixPath(
             "assets",
             "artifacts",
@@ -4654,6 +4814,13 @@ class FileLocalMediaExecutionService:
             ids["run_id"],
             SpecialistRunStatus.SUCCEEDED,
             summary=f"已生成并选择 {artifact.name}",
+        )
+        # The output is durable in assets now; the scratch (linked inputs,
+        # segments, output.mp4) is dead weight from here on.
+        await asyncio.to_thread(
+            _reclaim_task_scratch,
+            self.services.projects.project_root(task.project_id),
+            task.task_id,
         )
         return self._result_from_task(current_task, replayed=replayed)
 

@@ -30,6 +30,10 @@ from services.file_agent_runtime.registry import get_creator_agent_runtime
 from services.media_files.visual_reference_resolution import (
     preview_r2v_reference_order,
 )
+from services.project_files.blobs import (
+    ContentBlobStore,
+    read_document_ref_or_none,
+)
 from services.project_files.commit import (
     ActiveReviewConflictError,
     CommitJournalState,
@@ -358,17 +362,19 @@ def _recover_patch_response(
     # A changed transaction stores its exact published snapshot.  A no-change
     # transaction may omit final.json, in which case only an authority snapshot
     # with the journal's exact ETag is a valid reconstruction source.
-    project = AtomicJsonRecordStore(
+    final_document = read_document_ref_or_none(
+        ContentBlobStore(runtime_root),
         transaction_root / "final.json",
-        Project,
-    ).read_or_none()
-    if project is None:
+    )
+    if final_document is None:
         current = services.projects.read(project_id)
         if current.etag != journal.final_etag:
             raise StorageIntegrityError(
                 "Project Patch no-change response snapshot 已不可重建",
             )
         project = current.project
+    else:
+        project = Project.model_validate(final_document)
     if (
         project.project_id != project_id
         or project_etag(project) != journal.final_etag

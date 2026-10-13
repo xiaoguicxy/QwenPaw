@@ -25,6 +25,7 @@ from services.runtime_files import (
 )
 from services.runtime_files.session_store import ProjectRuntimeSessionStore
 
+from .asset_retention import prune_artifact_versions
 from .commit import ProjectCommitBoundary, ProjectCommitResult
 from .jq_transform import JqProjectTransformer
 from .poller import ProjectPoller, ProjectSnapshotCacheEntry
@@ -43,6 +44,7 @@ from .review import (
     render_rejection_feedback_message,
 )
 from .store import ProjectSnapshot, ProjectStore
+from .transaction_gc import reclaim_converged_transaction_storage
 
 
 logger = logging.getLogger(__name__)
@@ -117,7 +119,97 @@ def _startup_disk_gc(root: Path) -> None:
                 continue
             if stale and _remove_file(entry):
                 logger.info("startup GC removed stale export: %s", entry)
+    for orphan in list(root.glob("*/runtime/blobs/*/*.tmp")):
+        # Crashed blob publications leave compressed staging temps behind;
+        # completed blobs are published by rename and never use .tmp names.
+        if _remove_file(orphan):
+            logger.info("startup GC removed blob staging orphan: %s", orphan)
     _sweep_legacy_lock_artifacts(root)
+
+
+def _int_env(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("ignoring non-integer %s=%r", name, raw)
+        return default
+
+
+def _float_env(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("ignoring non-numeric %s=%r", name, raw)
+        return default
+
+
+def _startup_storage_retention(projects: ProjectStore) -> None:
+    """Apply bounded retention to converged transactions and asset versions.
+
+    Runs after recovery converged every journal and before the service
+    starts answering requests, so no in-flight commit can race the sweeps.
+    Negative values disable the corresponding policy.
+    """
+
+    keep_transactions = _int_env("CREATOR_TXN_KEEP_RECENT", 100)
+    transaction_days = _float_env("CREATOR_TXN_MAX_AGE_DAYS", 30.0)
+    keep_versions = _int_env("CREATOR_ASSET_VERSION_KEEP", 5)
+    blob_migration = _int_env("CREATOR_TXN_BLOB_MIGRATION", 1)
+    migration_budget = _float_env(
+        "CREATOR_TXN_MIGRATION_BUDGET_SECONDS",
+        30.0,
+    )
+    run_transactions = keep_transactions >= 0 and transaction_days > 0
+    run_assets = keep_versions >= 0
+    if not (run_transactions or run_assets):
+        return
+    mib = 1024 * 1024
+    for project_id in projects.discover_project_ids():
+        try:
+            if run_transactions:
+                report = reclaim_converged_transaction_storage(
+                    projects.project_root(project_id),
+                    keep_recent=keep_transactions,
+                    max_age_seconds=transaction_days * 86400.0,
+                    migrate_snapshots=blob_migration != 0,
+                    migration_budget_seconds=(
+                        None if migration_budget <= 0 else migration_budget
+                    ),
+                )
+                if not report.empty:
+                    logger.info(
+                        "startup retention for %s: pruned %d transaction(s) "
+                        "(%.1f MiB), swept %d orphan blob(s) (%.1f MiB), "
+                        "migrated %d inline snapshot(s) (%.1f MiB -> "
+                        "%.1f MiB pointers)",
+                        project_id,
+                        report.pruned_transactions,
+                        report.pruned_transaction_bytes / mib,
+                        report.removed_blobs,
+                        report.removed_blob_bytes / mib,
+                        report.migrated_snapshots,
+                        report.migrated_inline_bytes / mib,
+                        report.migrated_pointer_bytes / mib,
+                    )
+            if run_assets:
+                prune_artifact_versions(
+                    projects,
+                    project_id,
+                    keep_recent=max(1, keep_versions),
+                )
+        except Exception:
+            # Retention is best-effort housekeeping; one damaged project
+            # must never veto backend startup.
+            logger.exception(
+                "startup storage retention failed for %s",
+                project_id,
+            )
 
 
 def _legacy_lock_scopes(root: Path) -> list[tuple[Path, bool]]:
@@ -237,7 +329,8 @@ class CreatorFileServices:
     @classmethod
     def create(cls, root: Path) -> CreatorFileServices:
         projects = ProjectStore(root)
-        if _warn_on_second_backend(projects.root):
+        second_backend = _warn_on_second_backend(projects.root)
+        if second_backend:
             # A live peer may own the very artifacts this sweep deletes: an
             # in-flight staging tree, a streaming export, or (for an older
             # build) lock files it is still using.  Leave the data root alone
@@ -254,6 +347,10 @@ class CreatorFileServices:
         # Review decisions may depend on a compensating Project transaction.
         # Project journals therefore converge first, followed by Review facts.
         startup_review_recovery = reviews.recover_all()
+        if not second_backend:
+            # Retention only deletes converged history, so recovery must have
+            # run first; a suspected peer backend vetoes it like the disk GC.
+            _startup_storage_retention(projects)
         services = cls(
             root=root,
             projects=projects,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import errno
 import hashlib
 from io import BytesIO
 import os
@@ -13,6 +14,7 @@ import pytest
 from services.project_files.assets import (
     AssetAlreadyExists,
     AssetFileCorrupt,
+    AssetFileNotRegular,
     AssetFileStatus,
     AssetFileStore,
     AssetPathError,
@@ -268,3 +270,106 @@ def test_orphan_scan_marks_candidates_and_requires_persisted_grace(
 
     with pytest.raises(ValueError, match="positive"):
         store.scan_orphans(index, now=NOW, grace_period=timedelta(0))
+
+
+def _scratch_output(tmp_path, content: bytes = b"rendered video bytes"):
+    scratch = tmp_path / "scratch"
+    scratch.mkdir(exist_ok=True)
+    source = scratch / "output.bin"
+    source.write_bytes(content)
+    return source
+
+
+def test_stage_path_hard_links_and_consumes_source(tmp_path):
+    store = _store(tmp_path)
+    source = _scratch_output(tmp_path)
+    content = source.read_bytes()
+
+    staged = store.stage_path(source, consume_source=True)
+
+    assert staged.sha256 == hashlib.sha256(content).hexdigest()
+    assert staged.size_bytes == len(content)
+    assert staged.path.exists()
+    # Ownership transferred: the scratch entry is gone.
+    assert not source.exists()
+    # The staged entry is the source inode itself, never a copy.
+    published = store.publish(
+        staged,
+        "assets/artifacts/final.bin",
+        expected_sha256=staged.sha256,
+        expected_size_bytes=staged.size_bytes,
+    )
+    final = store.project_root / published.relative_uri
+    assert final.read_bytes() == content
+    assert os.lstat(final).st_nlink == 1  # sole owner after consumption
+    assert stat.S_IMODE(os.lstat(final).st_mode) == 0o600
+
+
+def test_stage_path_keeps_source_by_default_and_shares_inode(tmp_path):
+    store = _store(tmp_path)
+    source = _scratch_output(tmp_path)
+
+    staged = store.stage_path(source)
+
+    assert source.exists()
+    assert os.lstat(staged.path).st_ino == os.lstat(source).st_ino
+    assert os.lstat(staged.path).st_nlink == 2
+
+
+def test_stage_path_expected_mismatch_preserves_source(tmp_path):
+    store = _store(tmp_path)
+    source = _scratch_output(tmp_path)
+
+    with pytest.raises(StagedAssetError):
+        store.stage_path(
+            source,
+            consume_source=True,
+            expected_sha256="0" * 64,
+        )
+
+    # Forensics first: a mismatch never consumes the scratch entry and
+    # leaves no staged residue behind.
+    assert source.exists()
+    leftovers = [
+        item
+        for item in store.staging_root.iterdir()
+        if item.name.endswith(".part")
+    ]
+    assert leftovers == []
+
+
+def test_stage_path_falls_back_to_copy_across_devices(tmp_path, monkeypatch):
+    store = _store(tmp_path)
+    source = _scratch_output(tmp_path)
+    content = source.read_bytes()
+    real_link = os.link
+
+    def refuse_link(*args, **kwargs):
+        raise OSError(errno.EXDEV, "cross-device link refused")
+
+    monkeypatch.setattr(os, "link", refuse_link)
+    try:
+        staged = store.stage_path(source, consume_source=True)
+    finally:
+        monkeypatch.setattr(os, "link", real_link)
+
+    assert staged.sha256 == hashlib.sha256(content).hexdigest()
+    assert staged.size_bytes == len(content)
+    assert not source.exists()
+    published = store.publish(staged, "assets/artifacts/fallback.bin")
+    assert (
+        store.project_root / published.relative_uri
+    ).read_bytes() == content
+
+
+def test_stage_path_rejects_symlink_and_non_regular_sources(tmp_path):
+    store = _store(tmp_path)
+    source = _scratch_output(tmp_path)
+    link = tmp_path / "scratch" / "link.bin"
+    link.symlink_to(source)
+
+    with pytest.raises(AssetPathError, match="symlink"):
+        store.stage_path(link)
+
+    with pytest.raises(AssetFileNotRegular):
+        store.stage_path(tmp_path / "scratch")

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import mimetypes
+import os
 import re
 import tempfile
 import threading
@@ -55,11 +56,25 @@ _PREFERRED_NAME_PATTERN = re.compile(r"[^a-z0-9]+")
 
 @dataclass(frozen=True, slots=True)
 class TTSSynthesis:
-    audio_bytes: bytes
+    """One synthesized clip, carried as bytes (WebSocket) or a file (HTTP).
+
+    The WebSocket family streams straight into memory; the HTTP family
+    downloads to a temp file and hands over its path so the audio never
+    round-trips through RAM.  Exactly one carrier is populated.
+    """
+
     media_type: str
     model: str
     voice: str
     characters: int
+    audio_bytes: bytes = b""
+    audio_path: Path | None = None
+
+    def __post_init__(self) -> None:
+        if bool(self.audio_bytes) == (self.audio_path is not None):
+            raise ValueError(
+                "TTSSynthesis carries exactly one of audio_bytes/audio_path",
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -152,17 +167,30 @@ async def _post_json(
     raise ModelError("TTS request retries exhausted")
 
 
-def _download_audio(url: str) -> tuple[bytes, str]:
-    with tempfile.TemporaryDirectory(prefix="creator-tts-") as directory:
-        target = Path(directory) / "speech.wav"
-        download_remote_file(url, str(target))
-        content = target.read_bytes()
-    if not content:
-        raise ModelError("TTS returned an empty audio payload")
+def _download_audio(url: str) -> tuple[Path, str]:
+    """Stream one TTS payload to a persistent temp file; return its path.
+
+    The audio is never read back into RAM here: the caller consumes the file
+    in place (ffprobe for duration, hard-link ingest for storage), removing
+    the old download->read_bytes->re-stage RAM+disk round-trip.  The caller
+    owns the returned path and must unlink it when done.
+    """
+
     media_type = mimetypes.guess_type(urlparse(url).path)[0] or "audio/wav"
     if not media_type.startswith("audio/"):
         media_type = "audio/wav"
-    return content, media_type
+    suffix = mimetypes.guess_extension(media_type) or ".wav"
+    descriptor, name = tempfile.mkstemp(prefix="creator-tts-", suffix=suffix)
+    os.close(descriptor)
+    target = Path(name)
+    try:
+        download_remote_file(url, str(target))
+        if target.stat().st_size == 0:
+            raise ModelError("TTS returned an empty audio payload")
+    except BaseException:
+        target.unlink(missing_ok=True)
+        raise
+    return target, media_type
 
 
 def _is_abnormal_websocket_close(exc: BaseException) -> bool:
@@ -412,10 +440,13 @@ async def synthesize(
     audio_url = str(audio.get("url") or "")
     if not audio_url:
         raise ModelError(f"TTS response has no audio url: {output}")
-    content, media_type = await asyncio.to_thread(_download_audio, audio_url)
+    content_path, media_type = await asyncio.to_thread(
+        _download_audio,
+        audio_url,
+    )
     usage = data.get("usage") or {}
     return TTSSynthesis(
-        audio_bytes=content,
+        audio_path=content_path,
         media_type=media_type,
         model=model,
         voice=active_voice,

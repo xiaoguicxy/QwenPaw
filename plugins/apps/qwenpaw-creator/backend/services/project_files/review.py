@@ -32,6 +32,7 @@ from services.runtime_files.path_safety import (
     require_safe_runtime_segment,
 )
 
+from .blobs import ContentBlobStore, read_document_ref_or_none
 from .commit import (
     CommitJournalState,
     ProjectCommitBoundary,
@@ -1711,10 +1712,15 @@ class ProjectReviewService:
             raise ReviewDecisionConflict(
                 "finalized compensating transaction has no final ETag",
             )
-        final_project = AtomicJsonRecordStore(
+        final_document = read_document_ref_or_none(
+            ContentBlobStore(runtime_root),
             transaction_root / "final.json",
-            Project,
-        ).read_or_none()
+        )
+        final_project = (
+            None
+            if final_document is None
+            else Project.model_validate(final_document)
+        )
         if final_project is None:
             current = self.store.read(journal.project_id)
             if current.etag != commit_journal.final_etag:

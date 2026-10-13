@@ -45,6 +45,11 @@ from services.runtime_files.models import (
     SyncStatus,
 )
 
+from .blobs import (
+    ContentBlobStore,
+    read_document_ref,
+    read_document_ref_or_none,
+)
 from .commit import (
     CommitJournalState,
     ProjectCommitJournal,
@@ -331,9 +336,10 @@ class ProjectCommitRecoveryCoordinator:
                 CommitJournalState.PROJECT_REPLACED,
                 CommitJournalState.RUNTIME_FINALIZED,
             ):
-                probe_base = AtomicJsonRecordStore(
+                probe_base = read_document_ref_or_none(
+                    ContentBlobStore(runtime_root),
                     transaction_root / "base.json",
-                ).read_or_none()
+                )
                 skip_terminal = isinstance(probe_base, Mapping) and (
                     probe_base.get("schema_version")
                     != CURRENT_PROJECT_SCHEMA_VERSION
@@ -554,12 +560,15 @@ class ProjectCommitRecoveryCoordinator:
                 "legacy journal lacks explicit round_id/accepted-baseline semantics",
             )
 
-        base_value = AtomicJsonRecordStore(
+        blob_store = ContentBlobStore(runtime_root)
+        base_value = read_document_ref(
+            blob_store,
             transaction_root / "base.json",
-        ).read()
-        candidate_value = AtomicJsonRecordStore(
+        )
+        candidate_value = read_document_ref(
+            blob_store,
             transaction_root / "candidate.json",
-        ).read()
+        )
         if not isinstance(base_value, Mapping) or not isinstance(
             candidate_value,
             Mapping,
@@ -590,12 +599,14 @@ class ProjectCommitRecoveryCoordinator:
         latest_project: Project | None = None
         final_data: dict[str, Any] | None = None
         final_project: Project | None = None
-        latest_value = AtomicJsonRecordStore(
+        latest_value = read_document_ref_or_none(
+            blob_store,
             transaction_root / "latest.json",
-        ).read_or_none()
-        final_value = AtomicJsonRecordStore(
+        )
+        final_value = read_document_ref_or_none(
+            blob_store,
             transaction_root / "final.json",
-        ).read_or_none()
+        )
         # latest.json/final.json are written before one atomic journal update
         # records both publish ETags.  If the process dies in that narrow
         # window, PREPARED + no final_etag proves project.json was never

@@ -36,8 +36,13 @@ def test_require_text_rejects_empty_and_overlong() -> None:
     assert tts_model._require_text(" 你好 ") == "你好"
 
 
-def test_synthesize_uses_system_voice_and_flash_model(monkeypatch) -> None:
+def test_synthesize_uses_system_voice_and_flash_model(
+    monkeypatch,
+    tmp_path,
+) -> None:
     captured: dict = {}
+    audio_file = tmp_path / "speech.wav"
+    audio_file.write_bytes(b"RIFFxxxx")
     monkeypatch.setenv("TTS_API_KEY", "sk-test")
     monkeypatch.setattr(
         tts_model,
@@ -53,14 +58,16 @@ def test_synthesize_uses_system_voice_and_flash_model(monkeypatch) -> None:
     monkeypatch.setattr(
         tts_model,
         "_download_audio",
-        lambda url: (b"RIFFxxxx", "audio/wav"),
+        lambda url: (audio_file, "audio/wav"),
     )
 
     result = asyncio.run(tts_model.synthesize("你好世界", voice="Serena"))
     assert "multimodal-generation/generation" in captured["url"]
     assert captured["payload"]["model"] == model_config.get_tts_model_name()
     assert captured["payload"]["input"] == {"text": "你好世界", "voice": "Serena"}
-    assert result.audio_bytes == b"RIFFxxxx"
+    # The HTTP family hands over a temp-file path, never materializing bytes.
+    assert result.audio_path == audio_file
+    assert result.audio_bytes == b""
     assert result.characters == 4
 
 

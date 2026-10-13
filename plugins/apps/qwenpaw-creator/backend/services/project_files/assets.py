@@ -273,6 +273,184 @@ class AssetFileStore:
             staging_id=staging_id,
         )
 
+    def stage_path(
+        self,
+        source: Path,
+        *,
+        staging_id: str | None = None,
+        consume_source: bool = False,
+        expected_sha256: str | None = None,
+        expected_size_bytes: int | None = None,
+    ) -> StagedAsset:
+        """Stage a local regular file by hard link, never copying its bytes.
+
+        The staged entry is identity-checked (device+inode) against the
+        opened source descriptor, hashed, fsynced and tightened to the
+        private staging mode.  ``expected_sha256``/``expected_size_bytes``
+        are enforced *before* the source entry is touched, so a tampered
+        scratch file survives for forensics.  With ``consume_source`` the
+        source directory entry is removed after verification succeeds and
+        the store ends up the sole owner of the inode (``st_nlink == 1``),
+        which is what keeps published Assets immutable even if a retry
+        rewrites the scratch path.  Cross-device sources fall back to the
+        historical byte copy in :meth:`stage_stream`.
+        """
+
+        self._validate_roots()
+        if staging_id is not None and not _SAFE_STAGING_ID.fullmatch(
+            staging_id,
+        ):
+            raise AssetPathError(f"Unsafe staging id: {staging_id!r}")
+        if is_link_stat(source.lstat()):
+            raise AssetPathError("stage_path refuses a symlink source")
+        prefix = staging_id or "asset"
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_BINARY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(source, flags)
+        try:
+            source_stat = os.fstat(descriptor)
+            if not stat.S_ISREG(source_stat.st_mode):
+                raise AssetFileNotRegular(
+                    "stage_path source must be a regular file",
+                )
+            path = self.staging_root / f"{prefix}.{uuid4().hex}.part"
+            link_kwargs = (
+                {"follow_symlinks": False}
+                if os.link in os.supports_follow_symlinks
+                else {}
+            )
+            try:
+                os.link(source, path, **link_kwargs)
+            except OSError as link_error:
+                # A cross-device source or a filesystem that refuses hard
+                # links: fall back to the byte copy through the verified
+                # descriptor, then apply the same content and ownership
+                # contract below.  Logged explicitly because the fallback
+                # restores full byte-copy ingest cost, which should never
+                # degrade silently.
+                logger.info(
+                    "stage_path hard link refused (%s); falling back to "
+                    "byte copy for %s",
+                    link_error.strerror or link_error,
+                    source.name,
+                )
+                staged = self._stage_linked_fallback(
+                    descriptor,
+                    staging_id=staging_id,
+                )
+                descriptor = -1
+                self._settle_staged_source(
+                    staged,
+                    source,
+                    consume_source=consume_source,
+                    expected_sha256=expected_sha256,
+                    expected_size_bytes=expected_size_bytes,
+                )
+                return staged
+            try:
+                linked = path.lstat()
+                if (
+                    linked.st_dev != source_stat.st_dev
+                    or linked.st_ino != source_stat.st_ino
+                ):
+                    raise AssetFileError(
+                        "stage_path source changed during linking",
+                    )
+                sha256, size_bytes = self._rehash_staging_entry(path)
+                if size_bytes != source_stat.st_size:
+                    raise AssetFileCorrupt(
+                        "stage_path source changed during staging",
+                    )
+                _fsync_directory(self.staging_root)
+                staged = StagedAsset(
+                    project_root=self.project_root,
+                    path=path,
+                    sha256=sha256,
+                    size_bytes=size_bytes,
+                )
+            except BaseException:
+                path.unlink(missing_ok=True)
+                raise
+            self._settle_staged_source(
+                staged,
+                source,
+                consume_source=consume_source,
+                expected_sha256=expected_sha256,
+                expected_size_bytes=expected_size_bytes,
+            )
+            return staged
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+
+    def _stage_linked_fallback(
+        self,
+        descriptor: int,
+        *,
+        staging_id: str | None,
+    ) -> StagedAsset:
+        with os.fdopen(descriptor, "rb") as stream:
+            return self.stage_stream(stream, staging_id=staging_id)
+
+    def _settle_staged_source(
+        self,
+        staged: StagedAsset,
+        source: Path,
+        *,
+        consume_source: bool,
+        expected_sha256: str | None,
+        expected_size_bytes: int | None,
+    ) -> None:
+        """Enforce content expectations, then transfer sole ownership.
+
+        On a content mismatch the source entry is deliberately preserved:
+        it is the only forensic copy of what actually produced the bytes.
+        """
+
+        if (
+            expected_sha256 is not None
+            and staged.sha256 != expected_sha256
+        ) or (
+            expected_size_bytes is not None
+            and staged.size_bytes != expected_size_bytes
+        ):
+            self.abandon(staged)
+            raise StagedAssetError(
+                "Staged Asset does not match expected content",
+            )
+        if consume_source:
+            source.unlink(missing_ok=True)
+            _fsync_directory(source.parent)
+
+    def _rehash_staging_entry(self, path: Path) -> tuple[str, int]:
+        """Hash and fsync one staging entry the store just created."""
+
+        flags = os.O_RDWR | getattr(os, "O_BINARY", 0)
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(path, flags)
+        try:
+            if hasattr(os, "fchmod"):
+                os.fchmod(descriptor, 0o600)
+            digest = hashlib.sha256()
+            size_bytes = 0
+            with os.fdopen(descriptor, "rb", closefd=False) as handle:
+                while True:
+                    chunk = handle.read(self.chunk_size)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                    size_bytes += len(chunk)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        return digest.hexdigest(), size_bytes
+
     def publish(
         self,
         staged: StagedAsset,
@@ -637,6 +815,50 @@ class AssetFileStore:
         with self.open_verified(indexed) as stream:
             return stream.read()
 
+    def link_verified(self, indexed: IndexedFile, destination: Path) -> None:
+        """Hard-link an IndexedFile into read-only scratch, verifying content.
+
+        The destination shares the asset inode, so it costs no extra disk
+        blocks; callers must never write through it.  Content is re-verified
+        through the linked fd after linking, so a source swapped between
+        path validation and ``os.link`` fails closed: the destination is
+        unlinked and the verification error propagates.
+        """
+
+        os.link(self._candidate_path(indexed.relative_uri), destination)
+        try:
+            stream, actual_size = _open_regular(
+                destination,
+                missing_error=AssetFileMissing,
+            )
+        except BaseException:
+            destination.unlink(missing_ok=True)
+            raise
+        try:
+            if actual_size != indexed.size_bytes:
+                raise AssetFileCorrupt(
+                    f"Asset size mismatch for {indexed.file_id}: "
+                    f"expected={indexed.size_bytes}, actual={actual_size}",
+                )
+            actual_sha256, streamed_size = _hash_stream(
+                stream,
+                self.chunk_size,
+            )
+            if streamed_size != actual_size:
+                raise AssetFileCorrupt(
+                    f"Asset changed while being read: {indexed.file_id}",
+                )
+            if actual_sha256 != indexed.sha256:
+                raise AssetFileCorrupt(
+                    f"Asset sha256 mismatch for {indexed.file_id}: "
+                    f"expected={indexed.sha256}, actual={actual_sha256}",
+                )
+        except BaseException:
+            stream.close()
+            destination.unlink(missing_ok=True)
+            raise
+        stream.close()
+
     def scan_orphans(
         self,
         index: AssetIndex,
@@ -729,7 +951,7 @@ class AssetFileStore:
         except (OSError, ValueError) as exc:
             raise StagedAssetError("Staged Asset escapes its Project") from exc
 
-    def _open_candidate(self, relative_uri: str) -> tuple[BinaryIO, int]:
+    def _candidate_path(self, relative_uri: str) -> Path:
         parts = _asset_uri_parts(relative_uri)
         if parts[1] == ".staging":
             raise AssetPathError(
@@ -737,8 +959,13 @@ class AssetFileStore:
             )
         self._validate_roots()
         parent = self._require_final_parent(parts[1:-1])
-        target = parent / parts[-1]
-        return _open_regular(target, missing_error=AssetFileMissing)
+        return parent / parts[-1]
+
+    def _open_candidate(self, relative_uri: str) -> tuple[BinaryIO, int]:
+        return _open_regular(
+            self._candidate_path(relative_uri),
+            missing_error=AssetFileMissing,
+        )
 
     def _ensure_final_parent(self, directory_parts: tuple[str, ...]) -> Path:
         current = self.assets_root

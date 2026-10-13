@@ -89,8 +89,8 @@ def _stable_id(prefix: str, project_id: str, idempotency_key: str) -> str:
     return f"{prefix}-{digest}"
 
 
-def _wav_duration_seconds(content: bytes) -> float | None:
-    """Duration of a WAV payload, robust against streaming-writer headers.
+def _wav_duration_from_handle(handle: Any, size_bytes: int) -> float | None:
+    """Duration of an open WAV, robust against streaming-writer headers.
 
     qwen3-tts emits streamed WAVs whose data-chunk length is a placeholder
     (~2^30 frames), so the header-declared frame count can claim hours of
@@ -99,13 +99,13 @@ def _wav_duration_seconds(content: bytes) -> float | None:
     """
 
     with contextlib.suppress(Exception):
-        with wave.open(io.BytesIO(content)) as handle:
-            rate = handle.getframerate()
-            frame_bytes = handle.getnchannels() * handle.getsampwidth()
+        with wave.open(handle) as wav:
+            rate = wav.getframerate()
+            frame_bytes = wav.getnchannels() * wav.getsampwidth()
             if rate <= 0 or frame_bytes <= 0:
                 return None
-            header_seconds = handle.getnframes() / rate
-            byte_bound_seconds = len(content) / (rate * frame_bytes)
+            header_seconds = wav.getnframes() / rate
+            byte_bound_seconds = size_bytes / (rate * frame_bytes)
             duration = (
                 header_seconds
                 if header_seconds <= byte_bound_seconds + 1
@@ -113,6 +113,50 @@ def _wav_duration_seconds(content: bytes) -> float | None:
             )
             if duration > 0:
                 return round(duration, 3)
+    return None
+
+
+def _wav_duration_seconds(content: bytes) -> float | None:
+    """Duration of in-memory WAV bytes."""
+
+    return _wav_duration_from_handle(io.BytesIO(content), len(content))
+
+
+def _wav_duration_path(path: Path) -> float | None:
+    """Duration of a WAV file, read straight from disk (no RAM copy)."""
+
+    with contextlib.suppress(Exception):
+        with path.open("rb") as handle:
+            return _wav_duration_from_handle(
+                handle,
+                os.fstat(handle.fileno()).st_size,
+            )
+    return None
+
+
+def _ffprobe_duration_path(path: Path) -> float | None:
+    """Duration of an audio file, via ffprobe in place (no temp rewrite)."""
+
+    with contextlib.suppress(Exception):
+        completed = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "csv=p=0",
+                os.fspath(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=True,
+        )
+        value = float(completed.stdout.strip())
+        if value > 0:
+            return round(value, 3)
     return None
 
 
@@ -128,25 +172,7 @@ def _ffprobe_duration_seconds(content: bytes, media_type: str) -> float | None:
         with tempfile.TemporaryDirectory(prefix="creator-audio-") as directory:
             probe_path = Path(directory) / f"probe{extension}"
             probe_path.write_bytes(content)
-            completed = subprocess.run(
-                [
-                    "ffprobe",
-                    "-v",
-                    "error",
-                    "-show_entries",
-                    "format=duration",
-                    "-of",
-                    "csv=p=0",
-                    os.fspath(probe_path),
-                ],
-                capture_output=True,
-                text=True,
-                timeout=30,
-                check=True,
-            )
-            value = float(completed.stdout.strip())
-            if value > 0:
-                return round(value, 3)
+            return _ffprobe_duration_path(probe_path)
     return None
 
 
@@ -154,13 +180,44 @@ def _audio_duration_seconds(
     content: bytes,
     media_type: str,
 ) -> float | None:
-    """Duration of synthesized audio, whichever container it arrives in."""
+    """Duration of in-memory synthesized audio bytes."""
 
     if media_type in {"audio/wav", "audio/x-wav"}:
         wav_duration = _wav_duration_seconds(content)
         if wav_duration is not None:
             return wav_duration
     return _ffprobe_duration_seconds(content, media_type)
+
+
+def _synthesis_duration_seconds(synthesis: Any) -> float | None:
+    """Duration of a clip, from bytes (WebSocket) or its temp file (HTTP).
+
+    The HTTP family never materialized bytes, so its duration is probed
+    straight off the downloaded file, which also skips the temp rewrite the
+    bytes path needs.
+    """
+
+    path = synthesis.audio_path
+    if path is None:
+        return _audio_duration_seconds(
+            synthesis.audio_bytes,
+            synthesis.media_type,
+        )
+    if synthesis.media_type in {"audio/wav", "audio/x-wav"}:
+        wav_duration = _wav_duration_path(path)
+        if wav_duration is not None:
+            return wav_duration
+    return _ffprobe_duration_path(path)
+
+
+def _sha256_file(path: Path) -> str:
+    """Streaming sha256 of a file, so ingest never loads it into RAM."""
+
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _entity_id_from_ref(ref: str) -> str:
@@ -203,17 +260,32 @@ def _register_audio_asset(
     *,
     project_id: str,
     idempotency_key: str,
-    content: bytes,
     media_type: str,
     name: str,
     duration_seconds: float | None,
     metadata: Mapping[str, Any],
     provenance_refs: tuple[str, ...],
     caused_by_request_id: str,
+    content: bytes | None = None,
+    content_path: Path | None = None,
 ) -> FileTtsExecutionResult:
-    """Publish audio bytes + SourceAssetVersion; replays return the prior ids."""
+    """Publish one TTS clip + SourceAssetVersion; replays return the prior ids.
 
-    checksum = hashlib.sha256(content).hexdigest()
+    Exactly one of ``content``/``content_path`` carries the audio.  The path
+    form ingests by hard link (``consume_source``), so a downloaded HTTP clip
+    is never re-read into RAM nor rewritten on disk.
+    """
+
+    if content is not None:
+        checksum = hashlib.sha256(content).hexdigest()
+        size_bytes = len(content)
+    else:
+        if content_path is None:
+            raise ValidationError(
+                "TTS asset requires content or content_path",
+            )
+        checksum = _sha256_file(content_path)
+        size_bytes = content_path.stat().st_size
     logical_asset_id = _stable_id("asset", project_id, idempotency_key)
     version_id = _stable_id("asset-version", project_id, idempotency_key)
     file_id = _stable_id("file", project_id, idempotency_key)
@@ -256,7 +328,7 @@ def _register_audio_asset(
             kind="source_original",
             relative_uri=relative_uri,
             sha256=checksum,
-            size_bytes=len(content),
+            size_bytes=size_bytes,
             media_type=media_type,
             created_at=created_at,
         )
@@ -274,16 +346,25 @@ def _register_audio_asset(
             metadata=dict(metadata),
         )
         if file_id not in files:
-            staged = file_store.stage_bytes(
-                content,
-                staging_id=f"tts-{file_id[:48]}",
-            )
+            if content is not None:
+                staged = file_store.stage_bytes(
+                    content,
+                    staging_id=f"tts-{file_id[:48]}",
+                )
+            else:
+                staged = file_store.stage_path(
+                    content_path,
+                    staging_id=f"tts-{file_id[:48]}",
+                    consume_source=True,
+                    expected_sha256=checksum,
+                    expected_size_bytes=size_bytes,
+                )
             try:
                 file_store.publish(
                     staged,
                     relative_uri,
                     expected_sha256=checksum,
-                    expected_size_bytes=len(content),
+                    expected_size_bytes=size_bytes,
                 )
             except AssetAlreadyExists:
                 file_store.abandon(staged)
@@ -472,40 +553,45 @@ async def execute_file_tts_command(
         voice_model=voice_model or None,
         speech_rate=speech_rate,
     )
-    duration = _audio_duration_seconds(
-        synthesis.audio_bytes,
-        synthesis.media_type,
-    )
-    metadata: dict[str, Any] = {
-        "sourceKind": "tts_generation",
-        "model": synthesis.model,
-        "voice": synthesis.voice,
-        "textPreview": text[:120],
-        "textSha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
-        "characters": synthesis.characters,
-    }
-    if speech_rate is not None and speech_rate != 1.0:
-        metadata["speechRate"] = speech_rate
-    if character_entity_id:
-        metadata["characterEntityId"] = character_entity_id
-    if voice_id:
-        metadata["voiceId"] = voice_id
-    provenance = (f"tts:{synthesis.model}",) + (
-        (f"asset:{character_entity_id}",) if character_entity_id else ()
-    )
-    return await asyncio.to_thread(
-        _register_audio_asset,
-        services,
-        project_id=project_id,
-        idempotency_key=idempotency_key,
-        content=synthesis.audio_bytes,
-        media_type=synthesis.media_type,
-        name=label or f"TTS {text[:40]}",
-        duration_seconds=duration,
-        metadata=metadata,
-        provenance_refs=provenance,
-        caused_by_request_id=idempotency_key,
-    )
+    try:
+        duration = _synthesis_duration_seconds(synthesis)
+        metadata: dict[str, Any] = {
+            "sourceKind": "tts_generation",
+            "model": synthesis.model,
+            "voice": synthesis.voice,
+            "textPreview": text[:120],
+            "textSha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            "characters": synthesis.characters,
+        }
+        if speech_rate is not None and speech_rate != 1.0:
+            metadata["speechRate"] = speech_rate
+        if character_entity_id:
+            metadata["characterEntityId"] = character_entity_id
+        if voice_id:
+            metadata["voiceId"] = voice_id
+        provenance = (f"tts:{synthesis.model}",) + (
+            (f"asset:{character_entity_id}",) if character_entity_id else ()
+        )
+        return await asyncio.to_thread(
+            _register_audio_asset,
+            services,
+            project_id=project_id,
+            idempotency_key=idempotency_key,
+            media_type=synthesis.media_type,
+            name=label or f"TTS {text[:40]}",
+            duration_seconds=duration,
+            metadata=metadata,
+            provenance_refs=provenance,
+            caused_by_request_id=idempotency_key,
+            content=synthesis.audio_bytes or None,
+            content_path=synthesis.audio_path,
+        )
+    finally:
+        # The HTTP family downloads to a temp file; stage_path consumes it on
+        # success, and this cleans up on every early exit (probe, replay,
+        # collision, commit failure).  No-op for the WebSocket bytes family.
+        if synthesis.audio_path is not None:
+            synthesis.audio_path.unlink(missing_ok=True)
 
 
 def _extracted_video_audio_bytes(payload: bytes, *, suffix: str) -> bytes:

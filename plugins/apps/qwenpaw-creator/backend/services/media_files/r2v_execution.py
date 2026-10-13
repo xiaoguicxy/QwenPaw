@@ -64,6 +64,7 @@ from services.project_files.assets import (
     AssetAlreadyExists,
     AssetFileStore,
     StagedAsset,
+    StagedAssetError,
 )
 from services.project_files.facade import CreatorFileServices
 from services.project_files.models import (
@@ -1603,7 +1604,13 @@ def _stage_materialized_video(
     *,
     staging_id: str,
 ) -> StagedAsset:
-    """Stream a verified private scratch file into immutable Asset staging."""
+    """Transfer a verified private scratch file into immutable Asset staging.
+
+    The handoff is a hard link, never a byte copy: the content identity is
+    re-verified against the download-time fingerprint first, and only then
+    is the scratch entry consumed so the store owns the inode exclusively.
+    On any mismatch the scratch file is preserved for forensics.
+    """
 
     flags = (
         os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_CLOEXEC", 0)
@@ -1621,19 +1628,20 @@ def _stage_materialized_video(
             raise StorageIntegrityError(
                 "R2V materialized output is not a private file",
             )
-        with os.fdopen(descriptor, "rb") as source:
-            descriptor = -1
-            staged = file_store.stage_stream(source, staging_id=staging_id)
     finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-    if (
-        staged.sha256 != materialized.sha256
-        or staged.size_bytes != materialized.size_bytes
-    ):
-        file_store.abandon(staged)
-        raise StorageIntegrityError("R2V scratch changed during Asset staging")
-    return staged
+        os.close(descriptor)
+    try:
+        return file_store.stage_path(
+            materialized.path,
+            staging_id=staging_id,
+            consume_source=True,
+            expected_sha256=materialized.sha256,
+            expected_size_bytes=materialized.size_bytes,
+        )
+    except StagedAssetError as exc:
+        raise StorageIntegrityError(
+            "R2V scratch changed during Asset staging",
+        ) from exc
 
 
 class FileR2VExecutionService:
@@ -5549,6 +5557,20 @@ async def start_file_media_execution_services(
         services.root,
         project_ids,
     )
+    from .local_execution import reclaim_terminal_task_scratch
+
+    for project_id in project_ids:
+        try:
+            await asyncio.to_thread(
+                reclaim_terminal_task_scratch,
+                services,
+                project_id,
+            )
+        except Exception:  # noqa: BLE001 - startup sweep must not veto boot
+            logger.exception(
+                "skipping task scratch reclaim for Project %s",
+                project_id,
+            )
     await current.recover_all()
     return current
 
