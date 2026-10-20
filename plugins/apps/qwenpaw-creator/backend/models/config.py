@@ -778,6 +778,17 @@ def protocol_requires_api_key(protocol: str) -> bool:
     return is_anthropic_protocol(protocol) or is_gemini_protocol(protocol)
 
 
+def chat_temperature(model_name: str, value: float | None) -> float | None:
+    """Let Kimi K3 choose its supported sampling default.
+
+    DashScope rejects an explicit ``temperature`` for ``kimi-k3`` with
+    ``Parameter 'temperature'=0.2 is not supported for kimi-k3 model``;
+    returning ``None`` lets callers omit the field so the gateway applies
+    the model's own default.
+    """
+    return None if model_name.strip().casefold() == "kimi-k3" else value
+
+
 def get_vlm_chat_url() -> str:
     """Return the chat-completion endpoint URL for the configured VLM.
 
