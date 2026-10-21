@@ -163,6 +163,113 @@ def _marker_matches(marker: dict[str, Any], owner: dict[str, Any]) -> bool:
     )
 
 
+def _importlib_metadata_origin() -> str:
+    """Where ``importlib.metadata`` was actually imported from.
+
+    Only used to make a shadowed-stdlib diagnosis actionable in logs; any
+    failure to resolve it must not mask the original error.
+    """
+    try:
+        import importlib.metadata as _metadata
+
+        return str(getattr(_metadata, "__file__", "<builtin>"))
+    except Exception:  # pylint: disable=broad-except
+        return "<unavailable>"
+
+
+def _invalidate_import_caches() -> None:
+    """Refresh import caches, tolerating a broken stdlib metadata finder.
+
+    Container images whose ``PYTHONPATH`` shadows the running interpreter's
+    own stdlib can import an older ``importlib.metadata`` whose
+    ``MetadataPathFinder.invalidate_caches`` is missing ``@classmethod`` (a
+    since-fixed CPython bug), making the call raise ``TypeError``. Plugin
+    installation must not be blocked by that environment defect: the call
+    only shortens the window before freshly installed distributions become
+    importable, so degrade it to a warning instead of failing the install.
+    """
+    try:
+        importlib.invalidate_caches()
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.warning(
+            "importlib.invalidate_caches() failed (%s); import caches may "
+            "be stale, so freshly installed plugin dependencies might only "
+            "become visible after a restart. importlib.metadata is loaded "
+            "from %s while the interpreter is %s — a PYTHONPATH entry "
+            "shadowing the interpreter's own stdlib is the usual cause.",
+            exc,
+            _importlib_metadata_origin(),
+            sys.executable,
+        )
+
+
+# Install-location overrides exported by the launching environment. When one
+# of these is set, pip resolves a different destination than the one this
+# loader asked for; an inherited prefix also collides with an explicit
+# ``--target`` ("Cannot set --home and --prefix together"), which breaks the
+# sdist builds that rely on build isolation. ``PIP_USER`` maps to ``--user``,
+# which pip refuses outright next to ``--target`` ("Can not combine '--user'
+# and '--target'") and which images running as a non-root user commonly
+# export; ``PYTHONUSERBASE`` only relocates the user site, so it does not
+# cover that case.
+_PIP_INSTALL_LOCATION_VARS = (
+    "PIP_TARGET",
+    "PIP_PREFIX",
+    "PIP_USER",
+    "PYTHONUSERBASE",
+)
+
+
+def _package_installer_env() -> dict[str, str]:
+    """Environment for pip/uv subprocesses, free of install-location overrides.
+
+    Everything else is inherited unchanged so proxies, index URLs, caches and
+    locale settings keep working exactly as the deployment configured them.
+    """
+    env = os.environ.copy()
+    for name in _PIP_INSTALL_LOCATION_VARS:
+        env.pop(name, None)
+    return env
+
+
+async def _rollback_plain_install(
+    plugin_id: str,
+    target_dir: Path,
+    *,
+    created_target: bool,
+    pawport_owner: Optional[dict[str, Any]],
+) -> None:
+    """Remove a half-copied plugin directory after a failed install.
+
+    A PawPort install writes a marker that the outer lifecycle handler
+    already rolls back, and an in-place load (``source_path == target_dir``)
+    creates nothing, so both are skipped. A plain install writes no marker,
+    so without this the copied files survive a failed dependency install as
+    an "installed but won't open" zombie that no retry can recover — the
+    next attempt only reports that the target already exists.
+
+    ``created_target`` means this call owns the target's contents, not that
+    the directory did not exist before: a ``replace_files`` reinstall wipes
+    the previous plugin while copying, so rolling that back leaves the
+    target empty rather than restored. The previous contents are gone in
+    the copy step, before this function can be reached.
+    """
+    if not created_target or pawport_owner is not None:
+        return
+    logger.warning(
+        "Rolling back incomplete install of plugin '%s' at %s",
+        plugin_id,
+        target_dir,
+    )
+    try:
+        await asyncio.to_thread(shutil.rmtree, target_dir, True)
+    except BaseException:  # pylint: disable=broad-except
+        # A second cancellation here must not replace the real install
+        # failure with "cancelled"; the worker thread still completes the
+        # removal.
+        logger.debug("Rollback of plugin '%s' was interrupted", plugin_id)
+
+
 # Re-entrancy token for PluginLoader.plugin_lifecycle.
 # Key is (loader_id, task_id, plugin_id) so:
 # - nested calls on the *same* task can re-enter;
@@ -198,7 +305,7 @@ def _ensure_plugin_site_on_path() -> None:
     _site.addsitedir(site_dir)
     if site_dir not in sys.path:
         sys.path.insert(0, site_dir)
-    importlib.invalidate_caches()
+    _invalidate_import_caches()
 
 
 class PluginLoader:
@@ -462,7 +569,7 @@ class PluginLoader:
             # Another process may have installed while we waited; re-probe
             # with fresh import caches before spending resources on pip.
             _ensure_plugin_site_on_path()
-            importlib.invalidate_caches()
+            _invalidate_import_caches()
             if not self._find_unsatisfied_dependencies(requirements_file):
                 logger.info(
                     "Plugin '%s' dependencies already satisfied by a "
@@ -882,6 +989,16 @@ class PluginLoader:
             plugin_id,
             " ".join(cmd),
         )
+        inherited = [
+            name for name in _PIP_INSTALL_LOCATION_VARS if name in os.environ
+        ]
+        if inherited:
+            logger.debug(
+                "Ignoring install-location overrides inherited from the "
+                "environment for plugin '%s': %s",
+                plugin_id,
+                ", ".join(inherited),
+            )
         output_lines: List[str] = []
         with subprocess.Popen(
             cmd,
@@ -889,6 +1006,7 @@ class PluginLoader:
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
+            env=_package_installer_env(),
         ) as proc:
 
             def _read_output() -> None:
@@ -1091,7 +1209,7 @@ class PluginLoader:
                 f"Dependency installation failed for '{plugin_id}': "
                 f"{result.stdout}",
             )
-        importlib.invalidate_caches()
+        _invalidate_import_caches()
         logger.info(
             "Dependencies installed for plugin '%s' into %s",
             plugin_id,
@@ -1258,10 +1376,19 @@ class PluginLoader:
                 "Refusing to install.",
             )
 
+        # Whether this call owns the contents of *target_dir*: it created
+        # the directory, or ``replace_files`` removed a pre-existing one and
+        # staged new files into its place. An in-place load (``source_path
+        # == target_dir``) owns nothing. Rollback only removes what this
+        # call put there — but a ``replace_files`` reinstall has already
+        # deleted the previous plugin by the time the copy returns, so a
+        # failed install leaves the target empty rather than restored.
+        created_target = False
+
         # Copy files when source is not already the target (off the loop).
         if source_path != target_dir:
 
-            def _copy_tree() -> None:
+            def _copy_tree() -> bool:
                 if target_dir.exists():
                     marker_path = target_dir / _PAWPORT_MARKER
                     try:
@@ -1304,29 +1431,43 @@ class PluginLoader:
                     os.rename(stage_dir, target_dir)
                 finally:
                     shutil.rmtree(stage_root, ignore_errors=True)
+                return True
 
-            await asyncio.to_thread(_copy_tree)
+            created_target = await asyncio.to_thread(_copy_tree)
             logger.info(
                 f"Copied plugin '{plugin_id}' to {target_dir}",
             )
 
-        # Install Python dependencies (off the event loop)
-        requirements_file = target_dir / "requirements.txt"
-        if await asyncio.to_thread(requirements_file.exists):
-            await asyncio.to_thread(
-                self._install_requirements_locked,
-                requirements_file,
-                plugin_id,
-            )
+        try:
+            # Install Python dependencies (off the event loop)
+            requirements_file = target_dir / "requirements.txt"
+            if await asyncio.to_thread(requirements_file.exists):
+                await asyncio.to_thread(
+                    self._install_requirements_locked,
+                    requirements_file,
+                    plugin_id,
+                )
 
-        # Re-read manifest from the installed location so that
-        # source_path in the record points to the correct directory
-        _installed_path, installed_manifest = await asyncio.to_thread(
-            self._read_source_manifest,
-            target_dir,
-        )
-        del _installed_path
-        return await self.load_plugin(installed_manifest, target_dir, config)
+            # Re-read manifest from the installed location so that
+            # source_path in the record points to the correct directory
+            _installed_path, installed_manifest = await asyncio.to_thread(
+                self._read_source_manifest,
+                target_dir,
+            )
+            del _installed_path
+            return await self.load_plugin(
+                installed_manifest,
+                target_dir,
+                config,
+            )
+        except BaseException:
+            await _rollback_plain_install(
+                plugin_id,
+                target_dir,
+                created_target=created_target,
+                pawport_owner=pawport_owner,
+            )
+            raise
 
     def _remove_incomplete_pawport_plugin(
         self,

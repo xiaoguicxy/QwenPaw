@@ -459,3 +459,40 @@ class TestHubPluginLifecycle:
             await loading
         assert "qwenpaw" not in market_registry.snapshot()
         assert "broken-hub" not in loader.get_all_loaded_plugins()
+
+
+class TestPackageInstallerEnv:
+    def test_install_location_overrides_are_dropped(self, monkeypatch):
+        monkeypatch.setenv("PIP_TARGET", "/inherited/target")
+        monkeypatch.setenv("PIP_PREFIX", "/inherited/prefix")
+        monkeypatch.setenv("PYTHONUSERBASE", "/inherited/base")
+        monkeypatch.setenv("PIP_USER", "1")
+
+        env = pl._package_installer_env()
+
+        # Spelled out instead of read back from _PIP_INSTALL_LOCATION_VARS:
+        # a name missing from that tuple is exactly what must fail here.
+        inherited = ("PIP_TARGET", "PIP_PREFIX", "PIP_USER", "PYTHONUSERBASE")
+        for name in inherited:
+            assert name not in env
+
+    def test_pip_user_cannot_reach_the_target_install(self, monkeypatch):
+        """``--user`` next to ``--target`` aborts pip before it resolves.
+
+        Images running as a non-root user commonly export ``PIP_USER=1``,
+        and inheriting it failed every requirements install with "Can not
+        combine '--user' and '--target'".
+        """
+        monkeypatch.setenv("PIP_USER", "1")
+
+        assert "PIP_USER" not in pl._package_installer_env()
+
+    def test_deployment_mirrors_and_proxies_are_kept(self, monkeypatch):
+        """Only the install location is overridden, not how pip reaches it."""
+        monkeypatch.setenv("HTTPS_PROXY", "http://proxy:3128")
+        monkeypatch.setenv("PIP_INDEX_URL", "https://mirror/simple")
+
+        env = pl._package_installer_env()
+
+        assert env["HTTPS_PROXY"] == "http://proxy:3128"
+        assert env["PIP_INDEX_URL"] == "https://mirror/simple"
