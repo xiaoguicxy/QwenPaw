@@ -15,7 +15,10 @@ from urllib.parse import urlparse
 
 from domain.errors import StorageIntegrityError, ValidationError
 from models import config as model_config
-from models.media_transport import upload_local_file_to_dashscope_temp
+from models.vlm_model import (
+    transport_local_media_url,
+    uses_dashscope_transport,
+)
 from services.project_files.assets import AssetFileStore
 from services.project_files.facade import CreatorFileServices
 from services.project_files.remote_cache import resolve_remote_cache
@@ -212,7 +215,7 @@ async def _short_video_frame_parts(
             },
         ]
         for timestamp_ms, frame_path in frames:
-            public_url = await upload_local_file_to_dashscope_temp(
+            public_url = await transport_local_media_url(
                 frame_path,
                 api_key=api_key,
                 model_name=model_name,
@@ -253,9 +256,11 @@ async def source_intelligence_content_parts(
     assets panel carry no message attachment, so target refs are the only
     route to their media. Public URLs stay public so analysis can begin while
     the Runtime cache task is still downloading. File-backed versions are
-    uploaded to DashScope's model-bound temporary OSS. Clips shorter than the
-    model's native-video minimum are delivered as ordered frame sequences.
-    Nothing is silently converted to a textual URL placeholder.
+    handed to the provider-bound VLM transport, which uploads to DashScope's
+    model-bound temporary OSS or inlines Base64 for any other gateway.
+    Clips shorter than the model's native-video minimum are delivered as
+    ordered frame sequences. Nothing is silently converted to a textual URL
+    placeholder.
     """
 
     parts: list[dict[str, Any]] = []
@@ -352,6 +357,9 @@ async def source_intelligence_content_parts(
     file_store = AssetFileStore(services.projects.project_root(project_id))
     api_key = model_config.get_vlm_api_key().strip()
     model_name = (model_config.get_vlm_model_name() or "qwen3.7-plus").strip()
+    # Only the DashScope temporary-OSS transport presents this credential;
+    # every other gateway is served inline Base64 and needs no upload key.
+    needs_upload_key = uses_dashscope_transport()
     for version_id in dict.fromkeys(referenced_versions):
         version = snapshot.project.assets.source_versions_by_id.get(version_id)
         if version is None:
@@ -380,7 +388,7 @@ async def source_intelligence_content_parts(
             ):
                 local_path = _local_source_path(snapshot, file_store, version)
                 if local_path is not None:
-                    if not api_key:
+                    if needs_upload_key and not api_key:
                         raise ValidationError(
                             "本地素材传给素材理解 Agent 需要配置 Creator VLM API key",
                         )
@@ -411,12 +419,12 @@ async def source_intelligence_content_parts(
                 raise StorageIntegrityError(
                     f"用户素材 {version_id} 不可用: {inspection.status.value}",
                 )
-            if not api_key:
+            if needs_upload_key and not api_key:
                 raise ValidationError(
                     "本地素材传给素材理解 Agent 需要配置 Creator VLM API key",
                 )
             local_path = Path(file_store.project_root, indexed.relative_uri)
-            public_url = await upload_local_file_to_dashscope_temp(
+            public_url = await transport_local_media_url(
                 local_path,
                 api_key=api_key,
                 model_name=model_name,
@@ -470,7 +478,7 @@ async def document_page_content_parts(
     if not isinstance(refs, list) or not refs:
         return []
     api_key = model_config.get_vlm_api_key().strip()
-    if not api_key:
+    if uses_dashscope_transport() and not api_key:
         raise ValidationError(
             "文档页图传给素材理解 Agent 需要配置 Creator VLM API key",
         )
@@ -484,7 +492,7 @@ async def document_page_content_parts(
         _checksum, page, local_path = resolved
         if not local_path.is_file():
             raise StorageIntegrityError(f"文档页图不存在: {ref}")
-        public_url = await upload_local_file_to_dashscope_temp(
+        public_url = await transport_local_media_url(
             local_path,
             api_key=api_key,
             model_name=model_name,
@@ -534,7 +542,7 @@ async def video_frame_content_parts(
     if not isinstance(refs, list) or not refs:
         return []
     api_key = model_config.get_vlm_api_key().strip()
-    if not api_key:
+    if uses_dashscope_transport() and not api_key:
         raise ValidationError(
             "视频帧图传给专家 Agent 需要配置 Creator VLM API key",
         )
@@ -558,7 +566,7 @@ async def video_frame_content_parts(
             raise StorageIntegrityError(f"视频帧路径越界: {ref}")
         if not local_path.is_file():
             raise StorageIntegrityError(f"视频帧不存在: {ref}")
-        public_url = await upload_local_file_to_dashscope_temp(
+        public_url = await transport_local_media_url(
             local_path,
             api_key=api_key,
             model_name=model_name,
