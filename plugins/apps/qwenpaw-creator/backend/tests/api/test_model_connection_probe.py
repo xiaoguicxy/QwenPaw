@@ -1,15 +1,34 @@
 # -*- coding: utf-8 -*-
-"""Connectivity probes must stay zero-cost for non-chat models.
+"""Connectivity probes must measure the route production actually calls.
 
-Submitting real tasks (ASR/video) as a "ping" is billable and rejected
-by the DashScope gateway with 403; probes use free read-only APIs.
+Image and video probes stay on free read-only APIs: submitting a real
+generation task is billable, and the DashScope gateway rejects an async
+submission that omits ``X-DashScope-Async`` with 403. ASR is the exception —
+one second of generated silence costs a fraction of a cent, and the free
+probes it used to rely on (``GET /models/{id}``, the upload-policy call) said
+nothing about transcription, which is how three dead ASR routes stayed green.
 """
 
 from __future__ import annotations
 
+import asyncio
+import io
+import wave
+
 import pytest
 
-from api.model_routes import _minimax_base_resp_error, _probe_payload
+from api import model_routes
+from api.model_routes import (
+    _asr_provider,
+    _minimax_base_resp_error,
+    _prepare_probe_payload,
+    _probe_payload,
+    _send_probe,
+    _silent_wav_bytes,
+    _validate_section_connectivity,
+)
+from domain.errors import ValidationError
+from models import media_transport
 from schemas.models import ModelConnectionTestRequest
 
 
@@ -26,15 +45,381 @@ def _request(**overrides) -> ModelConnectionTestRequest:
     return ModelConnectionTestRequest(**payload)
 
 
-def test_dashscope_probe_uses_upload_policy() -> None:
-    url, headers, payload = _probe_payload(_request())
-    assert url == "https://dashscope.aliyuncs.com/api/v1/uploads"
+@pytest.fixture(name="uploaded_samples")
+def _uploaded_samples(monkeypatch: pytest.MonkeyPatch) -> list:
+    """Stub the DashScope temporary-OSS upload, recording what it was given."""
+
+    calls: list = []
+
+    async def upload(path, **kwargs):
+        calls.append((path.name, path.read_bytes(), kwargs))
+        return "oss://dashscope/creator-probe.wav"
+
+    monkeypatch.setattr(
+        media_transport,
+        "upload_local_file_to_dashscope_temp",
+        upload,
+    )
+    return calls
+
+
+def _probe(request):
+    return asyncio.run(_prepare_probe_payload(request))
+
+
+def test_asr_fun_probe_submits_a_real_transcription_task(
+    uploaded_samples,
+) -> None:
+    """Fun-ASR is probed on the route production transcribes with.
+
+    Regression guard: the probe used to call the DashScope upload-policy API,
+    which says nothing about transcription, so a platform answering 404 on
+    ``asr/transcription`` still showed a green connection test.
+    """
+
+    url, headers, payload = _probe(_request())
+
+    assert url == (
+        "https://dashscope.aliyuncs.com/api/v1"
+        "/services/audio/asr/transcription"
+    )
+    # Without this header the gateway answers 403 "does not support
+    # asynchronous calls" — the failure that pushed the probe onto the
+    # zero-cost policy call in the first place.
+    assert headers["X-DashScope-Async"] == "enable"
+    assert headers["X-DashScope-OssResourceResolve"] == "enable"
     assert payload == {
-        "_get_probe": True,
-        "action": "getPolicy",
         "model": "fun-asr",
+        "input": {"file_urls": ["oss://dashscope/creator-probe.wav"]},
+        "parameters": {},
     }
+    # The sample really was uploaded, and it really is audio.
+    name, sample, kwargs = uploaded_samples[0]
+    assert name == "creator-probe.wav"
+    assert sample == _silent_wav_bytes()
+    assert kwargs["media_type"] == "audio/wav"
+    assert kwargs["api_key"] == "sk-test"
+
+
+def test_asr_fun_probe_does_not_double_a_token_portal_path(
+    uploaded_samples,
+) -> None:
+    """A base URL already carrying the transcription path must not repeat it.
+
+    ``_fun_asr_base`` strips the suffix for production; the probe has to join
+    back to the same URL or the proxy rejects the doubled path with 403.
+    """
+
+    del uploaded_samples
+    url, _headers, _payload = _probe(
+        _request(
+            base_url=(
+                "https://dashscope.aliyuncs.com/api/v1"
+                "/services/audio/asr/transcription"
+            ),
+        ),
+    )
+
+    assert url == (
+        "https://dashscope.aliyuncs.com/api/v1"
+        "/services/audio/asr/transcription"
+    )
+
+
+def test_asr_qwen3_probe_uses_the_multimodal_generation_route(
+    uploaded_samples,
+) -> None:
+    """qwen3-asr must not be probed as if it were Fun-ASR.
+
+    The previous dispatch never produced ``qwen3-asr``, so that config was
+    validated against the Fun-ASR upload-policy call while production posted
+    to ``multimodal-generation`` — the route that answered 502 in the field.
+    """
+
+    del uploaded_samples
+    url, headers, payload = _probe(
+        _request(
+            model_name="qwen3-asr-flash",
+            provider="fun-asr",
+            protocol="DashScope Qwen3-ASR",
+        ),
+    )
+
+    assert url == (
+        "https://dashscope.aliyuncs.com"
+        "/api/v1/services/aigc/multimodal-generation/generation"
+    )
+    assert headers["X-DashScope-OssResourceResolve"] == "enable"
     assert "X-DashScope-Async" not in headers
+    assert payload == {
+        "model": "qwen3-asr-flash",
+        "input": {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"audio": "oss://dashscope/creator-probe.wav"},
+                    ],
+                },
+            ],
+        },
+        "parameters": {"result_format": "message"},
+    }
+
+
+def test_asr_whisper_probe_posts_a_real_multipart_transcription(
+    uploaded_samples,
+) -> None:
+    """Whisper is probed by transcribing, not by looking the model up.
+
+    ``GET /models/whisper-1`` only proves the key and the registry entry; the
+    field failure was a 500 on ``audio/transcriptions`` itself.
+    """
+
+    url, headers, payload = _probe(
+        _request(
+            base_url="https://api.openai.com/v1",
+            model_name="whisper-1",
+            protocol="OpenAI Whisper",
+            provider="whisper",
+        ),
+    )
+
+    assert url == "https://api.openai.com/v1/audio/transcriptions"
+    multipart = payload["_multipart_probe"]
+    assert multipart["data"] == {
+        "model": "whisper-1",
+        "response_format": "verbose_json",
+    }
+    name, sample, mime = multipart["files"]["file"]
+    assert (name, mime) == ("creator-probe.wav", "audio/wav")
+    assert sample == _silent_wav_bytes()
+    assert headers["Authorization"] == "Bearer sk-test"
+    # OpenAI-compatible whisper takes the bytes inline: no DashScope upload.
+    assert uploaded_samples == []
+
+
+def test_asr_protocol_label_cannot_redirect_the_probe(
+    uploaded_samples,
+) -> None:
+    """A Whisper protocol label must not move a Fun-ASR config's probe.
+
+    ``get_asr_provider()`` reads only the stored provider, so this config
+    transcribes through Fun-ASR. Probing ``audio/transcriptions`` instead
+    would succeed against an OpenAI-compatible base URL and report green
+    for a route production never calls.
+    """
+
+    del uploaded_samples
+    url, headers, _payload = _probe(
+        _request(
+            base_url="https://api.openai.com/v1",
+            model_name="whisper-1",
+            protocol="OpenAI Whisper",
+            provider="fun-asr",
+        ),
+    )
+
+    assert url == (
+        "https://api.openai.com/v1/services/audio/asr/transcription"
+    )
+    assert headers["X-DashScope-Async"] == "enable"
+
+
+@pytest.mark.parametrize(
+    ("provider", "protocol", "model_name", "expected"),
+    [
+        ("whisper", "", "whisper-1", "whisper"),
+        # get_asr_provider() reads only the stored provider and defaults to
+        # fun-asr, so the protocol label never decides the route.
+        (None, "OpenAI Whisper", "whisper-1", "fun-asr"),
+        # A protocol/provider mismatch is a broken config, not a licence to
+        # probe the route the label implies.
+        ("fun-asr", "OpenAI Whisper", "whisper-1", "fun-asr"),
+        # get_asr_provider() only ever returns whisper or fun-asr, so a
+        # qwen3-asr model arrives labelled fun-asr and is routed by name.
+        ("fun-asr", "", "qwen3-asr-flash", "qwen3-asr"),
+        (None, "", "qwen3-asr-flash", "qwen3-asr"),
+        ("fun-asr", "DashScope Fun-ASR", "fun-asr", "fun-asr"),
+        (None, "", "paraformer-v2", "fun-asr"),
+    ],
+)
+def test_asr_provider_mirrors_the_production_dispatch(
+    provider,
+    protocol,
+    model_name,
+    expected,
+) -> None:
+    """The probe must run the route ``asr_model.transcribe`` would run."""
+
+    assert (
+        _asr_provider(
+            _request(
+                provider=provider,
+                protocol=protocol,
+                model_name=model_name,
+            ),
+        )
+        == expected
+    )
+
+
+def test_silent_probe_sample_is_one_second_of_decodable_silence() -> None:
+    """The sample must be real audio, or the probe proves nothing."""
+
+    with wave.open(io.BytesIO(_silent_wav_bytes()), "rb") as handle:
+        assert handle.getnchannels() == 1
+        assert handle.getsampwidth() == 2
+        assert handle.getframerate() == 16_000
+        assert handle.getnframes() == 16_000
+        assert handle.readframes(16_000) == b"\x00" * 32_000
+
+
+def test_probe_payload_refuses_to_guess_an_asr_route() -> None:
+    """ASR dispatch is async; the sync path must not silently fall through."""
+
+    with pytest.raises(ValueError, match="_prepare_probe_payload"):
+        _probe_payload(_request())
+
+
+class _EmptyAsrConfig:
+    """A stored config with nothing filled in, as a first-run install has."""
+
+    class _Item:
+        api_key = ""
+        base_url = ""
+        model_name = ""
+        protocol = ""
+        provider = None
+        voice = ""
+        reuse_llm_key = False
+
+    asr = _Item()
+    llm = _Item()
+
+
+def test_connection_test_reports_an_unstageable_sample_as_a_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A probe that cannot stage its own sample must still report cleanly.
+
+    The Fun-ASR and qwen3-asr probes upload the silent sample through the
+    real DashScope temporary OSS, which refuses an absent credential with a
+    ``RuntimeError``. Uncaught, that turned the endpoint whose whole job is
+    explaining a broken configuration into a 500.
+    """
+
+    monkeypatch.setattr(model_routes, "load_model_config", _EmptyAsrConfig)
+
+    response = asyncio.run(
+        model_routes.test_model_connection(
+            # require_api_key=False is the caller's choice; the probe still
+            # has to cope with the empty credential instead of exploding.
+            _request(api_key="", require_api_key=False),
+        ),
+    )
+
+    assert not response.ok
+    assert "RuntimeError" in response.error
+    assert "API key" in response.error
+
+
+def test_section_validator_reports_a_refused_probe_upload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A refused sample upload belongs in the 422 channel, not a 500.
+
+    ``_validate_section_connectivity`` has no caller today, so this pins the
+    contract for whenever it is wired into config save: the ASR probe is the
+    only one that can fail before it puts anything on the wire, and that
+    failure is a finding about the section like any other.
+    """
+
+    async def refused_upload(*_args, **_kwargs):
+        raise RuntimeError("DashScope upload policy missing max_file_size_mb")
+
+    monkeypatch.setattr(
+        media_transport,
+        "upload_local_file_to_dashscope_temp",
+        refused_upload,
+    )
+
+    with pytest.raises(ValidationError, match="max_file_size_mb"):
+        asyncio.run(
+            _validate_section_connectivity(
+                "asr",
+                {
+                    "asr": {
+                        "enabled": True,
+                        "base_url": "https://dashscope.aliyuncs.com/api/v1",
+                        "api_key": "sk-test",
+                        "model_name": "fun-asr",
+                        "protocol": "DashScope Fun-ASR",
+                        "provider": "fun-asr",
+                    },
+                },
+            ),
+        )
+
+
+class _FakeClient:
+    """Records the request ``_send_probe`` would put on the wire."""
+
+    def __init__(self) -> None:
+        self.calls: list = []
+
+    async def get(self, url, *, headers, params):
+        self.calls.append(("GET", url, headers, params, None, None))
+        return "response"
+
+    async def post(self, url, *, headers, json=None, data=None, files=None):
+        self.calls.append(("POST", url, headers, json, data, files))
+        return "response"
+
+
+def test_send_probe_shapes_the_request_per_probe_marker() -> None:
+    """One sender for all three probe shapes, so none can drift apart."""
+
+    client = _FakeClient()
+    probe_url = "https://example.test/v1"
+    auth = {"Content-Type": "application/json", "Authorization": "Bearer k"}
+    for payload in (
+        {"_get_probe": True, "action": "getPolicy"},
+        {
+            "_multipart_probe": {
+                "data": {"model": "whisper-1"},
+                "files": {"file": ("a.wav", b"\x00", "audio/wav")},
+            },
+        },
+        {"model": "qwen-plus"},
+    ):
+        asyncio.run(
+            _send_probe(client, probe_url, dict(auth), payload),
+        )
+
+    verb, _url, headers, params, _json, _files = client.calls[0]
+    assert (verb, headers, params) == (
+        "GET",
+        {"Authorization": "Bearer k"},
+        {"action": "getPolicy"},
+    )
+
+    verb, _url, headers, sent_json, data, files = client.calls[1]
+    # httpx has to write the multipart boundary itself.
+    assert verb == "POST"
+    assert "Content-Type" not in headers
+    assert sent_json is None
+    assert data == {"model": "whisper-1"}
+    assert files == {"file": ("a.wav", b"\x00", "audio/wav")}
+
+    verb, _url, headers, sent_json, data, files = client.calls[2]
+    assert (verb, sent_json, data, files) == (
+        "POST",
+        {"model": "qwen-plus"},
+        None,
+        None,
+    )
+    assert headers["Content-Type"] == "application/json"
 
 
 @pytest.mark.parametrize(

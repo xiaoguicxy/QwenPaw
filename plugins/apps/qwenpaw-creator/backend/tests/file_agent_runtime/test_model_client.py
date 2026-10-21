@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 
 from agentscope.message import (
@@ -38,6 +39,58 @@ from services.file_agent_runtime.model_context import (
 )
 
 pytestmark = pytest.mark.unit
+
+
+def test_inline_media_is_charged_as_vision_tokens_not_base64_text():
+    """A media-bearing contract message must fit the serialized budget.
+
+    Regression guard: ``size()`` used to count the whole messages JSON as
+    text, so one 2MB image inlined as a ~2.7MB Base64 data URL exceeded the
+    384KB budget by itself. Media-bearing user messages are contract content
+    that compaction may not drop, so the request was refused locally and never
+    reached the provider — the understanding record just came back empty.
+    """
+    encoded = base64.b64encode(b"\x00" * (2 * 1024 * 1024)).decode()
+    data_url = f"data:image/jpeg;base64,{encoded}"
+    messages = [
+        {"role": "system", "content": "项目创作契约"},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "理解这张图"},
+                {"type": "image_url", "image_url": {"url": data_url}},
+            ],
+        },
+    ]
+
+    result = prepare_model_messages(messages, [])
+
+    # Inline media is charged, never dropped or rewritten.
+    assert result[1]["content"][1]["image_url"]["url"] == data_url
+    assert result[0]["content"] == "项目创作契约"
+
+
+def test_oversized_inline_media_is_still_refused():
+    """The vision-token charge has a floor, so media is never free."""
+    # 1MB decoded → charge = 1MB / 128 = 8KB, exactly the per-media floor.
+    encoded = base64.b64encode(b"\x00" * (1024 * 1024)).decode()
+    data_url = f"data:image/jpeg;base64,{encoded}"
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": data_url}},
+                {"type": "image_url", "image_url": {"url": data_url}},
+                {"type": "image_url", "image_url": {"url": data_url}},
+            ],
+        },
+    ]
+
+    # Three floors are ~24KB of charged media. Under a 16KB budget nothing
+    # fits and there is no droppable tool group, so the guard fails closed
+    # instead of letting an oversized request reach the provider.
+    with pytest.raises(ModelContextBudgetError):
+        prepare_model_messages(messages, [], max_bytes=16 * 1024)
 
 
 def test_long_production_compacts_automatic_history_but_keeps_human_input():
