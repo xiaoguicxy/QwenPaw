@@ -410,7 +410,10 @@ function ThinkingDisclosure({
 
 export function simplifyErrorMessage(text: string): string {
   // Classify known failures without exposing raw provider payloads or secrets.
-  if (/temperature/i.test(text) && /not supported|unsupported/i.test(text)) {
+  if (
+    /temperature/i.test(text) &&
+    /not supported|unsupported|invalid/i.test(text)
+  ) {
     return i18n.t("agentActivity.unsupportedTemperature");
   }
   return i18n.t("agentActivity.failureHint");
