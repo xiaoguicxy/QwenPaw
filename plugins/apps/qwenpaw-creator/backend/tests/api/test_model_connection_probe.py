@@ -19,7 +19,10 @@ import pytest
 
 from api import model_routes
 from api.model_routes import (
+    ProbeDestinationError,
     _asr_provider,
+    _assert_probe_destination,
+    _assert_probe_peer,
     _minimax_base_resp_error,
     _prepare_probe_payload,
     _probe_payload,
@@ -324,6 +327,35 @@ def test_connection_test_reports_an_unstageable_sample_as_a_failure(
     assert "API key" in response.error
 
 
+def test_connection_test_reports_a_metadata_target_as_a_failure(
+    uploaded_samples,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A refused destination is a diagnostic answer, not a server error.
+
+    End to end, because the exception being a ``ValueError`` only matters if
+    the route's handler still lists ``ValueError``: drop it from that tuple
+    and the endpoint whose job is explaining a broken configuration answers
+    with a 500 instead.
+    """
+
+    del uploaded_samples
+    monkeypatch.setattr(model_routes, "load_model_config", _EmptyAsrConfig)
+
+    response = asyncio.run(
+        model_routes.test_model_connection(
+            _request(
+                base_url="http://169.254.169.254/latest/meta-data",
+                require_api_key=False,
+            ),
+        ),
+    )
+
+    assert not response.ok
+    assert "ProbeDestinationError" in response.error
+    assert "元数据" in response.error
+
+
 def test_section_validator_reports_a_refused_probe_upload(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -420,6 +452,197 @@ def test_send_probe_shapes_the_request_per_probe_marker() -> None:
         None,
     )
     assert headers["Content-Type"] == "application/json"
+
+
+class _FakeStream:
+    """Stands in for httpx's network stream, naming the connected peer."""
+
+    def __init__(self, peer: str) -> None:
+        self.peer = peer
+
+    def get_extra_info(self, key: str):
+        return (self.peer, 443) if key == "server_addr" else None
+
+
+class _FakeResponse:
+    """A response whose peer is known, or that has no network stream."""
+
+    def __init__(self, peer: str | None) -> None:
+        self.extensions = (
+            {} if peer is None else {"network_stream": _FakeStream(peer)}
+        )
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://169.254.169.254/latest/meta-data/iam/",
+        # AWS answers IPv6 from a ULA, Alibaba Cloud from the shared
+        # address space: neither is link-local, so a range check alone
+        # would let both through.
+        "http://[fd00:ec2::254]/latest/meta-data/",
+        "http://100.100.100.200/latest/meta-data/",
+        "http://169.254.1.1:8080/v1/chat/completions",
+        "http://[fe80::1]/v1",
+    ],
+)
+def test_probe_destination_refuses_the_metadata_service(url: str) -> None:
+    """Cloud metadata hands instance credentials to anything that asks.
+
+    No model endpoint is ever served from those addresses, and a probe
+    carries the configured API key, so reaching one would leak the key and
+    read back the instance's own role credentials.
+    """
+
+    with pytest.raises(ProbeDestinationError, match="元数据"):
+        _assert_probe_destination(url)
+
+
+def test_probe_destination_error_is_a_value_error() -> None:
+    """A refused destination must stay an ``ok=False`` answer, not a 500.
+
+    ``test_model_connection`` catches ``(httpx.HTTPError, ValueError,
+    RuntimeError)`` and renders the message as a diagnostic. Re-parenting
+    this exception onto ``domain.errors.ValidationError`` would turn the
+    endpoint whose job is explaining a broken configuration into a server
+    error, which is the same trap the ASR upload refusal fell into.
+    """
+
+    assert issubclass(ProbeDestinationError, ValueError)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        # Self-hosted gateways are a first-class Creator setup.
+        "http://localhost:11434/v1/chat/completions",
+        "http://127.0.0.1:8000/v1",
+        "http://[::1]:1234/v1",
+        "http://192.168.1.20:30010/v1/videos",
+        "http://10.0.0.8/v1",
+        "https://dashscope.aliyuncs.com/api/v1",
+        "https://api.openai.com/v1/audio/transcriptions",
+    ],
+)
+def test_probe_destination_allows_operator_configured_endpoints(
+    url: str,
+) -> None:
+    """Loopback and RFC1918 targets must keep probing successfully.
+
+    ``safe_remote_download.require_public_ip`` rejects every non-global
+    address, but it guards URLs a provider handed us. A probe target is the
+    Base URL the operator typed into the model form, so applying that policy
+    here would break every Ollama, vLLM and SGLang deployment the moment its
+    connection is tested.
+    """
+
+    _assert_probe_destination(url)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "file:///etc/passwd",
+        "gopher://127.0.0.1:25/_",
+        "ftp://example.test/v1",
+        "/v1/chat/completions",
+        "https://dashscope.aliyuncs.com@evil.example/v1",
+        "https://user:secret@example.test/v1",
+    ],
+)
+def test_probe_destination_refuses_other_schemes_and_credentials(
+    url: str,
+) -> None:
+    """Only a plain http(s) host the operator named may be probed.
+
+    ``https://dashscope.aliyuncs.com@evil.example`` reads as a trusted host
+    in a log while the request actually goes to evil.example with the
+    bearer key attached.
+    """
+
+    with pytest.raises(ProbeDestinationError):
+        _assert_probe_destination(url)
+
+
+def test_probe_peer_refuses_a_metadata_socket() -> None:
+    """The connected peer is checked, not just the hostname.
+
+    A pre-flight lookup and the connection are separate resolutions, so a
+    hostname can answer with a public address and then land on the metadata
+    service. The peer the socket reached cannot lie about that.
+    """
+
+    for peer in ("169.254.169.254", "fd00:ec2::254", "100.100.100.200"):
+        with pytest.raises(ProbeDestinationError, match="元数据"):
+            _assert_probe_peer(_FakeResponse(peer))
+
+    # A public peer and a loopback gateway both pass, and a transport with
+    # no network stream (a test double, in-process ASGI) has no peer to
+    # verify, so it is skipped rather than failing every probe.
+    _assert_probe_peer(_FakeResponse("93.184.216.34"))
+    _assert_probe_peer(_FakeResponse("127.0.0.1"))
+    _assert_probe_peer(_FakeResponse(None))
+    _assert_probe_peer("response")
+
+
+def test_send_probe_refuses_before_any_request_is_made() -> None:
+    """A literal link-local target never reaches the wire.
+
+    The credential is in the headers argument, so the point of checking
+    first is that nothing carrying it is ever sent.
+    """
+
+    client = _FakeClient()
+
+    with pytest.raises(ProbeDestinationError):
+        asyncio.run(
+            _send_probe(
+                client,
+                "http://169.254.169.254/latest/meta-data/",
+                {"Authorization": "Bearer sk-live"},
+                {"model": "qwen-plus"},
+            ),
+        )
+
+    assert not client.calls
+
+
+def test_send_probe_rejects_a_response_from_a_metadata_peer() -> None:
+    """A hostname resolving onto the metadata service is caught too."""
+
+    class _PeerClient(_FakeClient):
+        async def post(
+            self,
+            url,
+            *,
+            headers,
+            json=None,
+            data=None,
+            files=None,
+        ):
+            await super().post(
+                url,
+                headers=headers,
+                json=json,
+                data=data,
+                files=files,
+            )
+            return _FakeResponse("100.100.100.200")
+
+    client = _PeerClient()
+
+    with pytest.raises(ProbeDestinationError, match="元数据"):
+        asyncio.run(
+            _send_probe(
+                client,
+                "https://gateway.example/v1",
+                {},
+                {"model": "qwen-plus"},
+            ),
+        )
+
+    # The request did go out, which is exactly why the peer check exists.
+    assert len(client.calls) == 1
 
 
 @pytest.mark.parametrize(
