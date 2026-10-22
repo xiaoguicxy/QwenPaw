@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import ipaddress
 import json
 import os
 import re
@@ -18,7 +19,7 @@ import time
 import wave
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit
 
 import httpx
 from fastapi import APIRouter, Body, Header, Query, Request, Response, status
@@ -1018,7 +1019,13 @@ async def _validate_section_connectivity(
         provider=item.get("provider"),
     )
 
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with httpx.AsyncClient(
+        timeout=30,
+        # A probe must reach the configured endpoint, not wherever it is
+        # waved on to: following a redirect would let a public host bounce
+        # the bearer credential into the internal network.
+        follow_redirects=False,
+    ) as client:
         try:
             probe_request = await _prepare_probe_payload(probe)
             resp = await _send_probe(client, *probe_request)
@@ -1880,6 +1887,116 @@ async def _prepare_probe_payload(
     return url, headers, payload
 
 
+class ProbeDestinationError(ValueError):
+    """A probe target violated the destination policy.
+
+    Subclasses ``ValueError`` on purpose: ``test_model_connection`` catches
+    ``(httpx.HTTPError, ValueError, RuntimeError)`` and renders the message
+    as an ``ok=False`` diagnostic. ``domain.errors.ValidationError`` is not
+    a ``ValueError``, so raising that instead would make the endpoint whose
+    job is explaining a broken configuration answer with a 500.
+    """
+
+
+# Cloud metadata services hand instance credentials to anything that asks.
+# Most answer from the link-local range (169.254.169.254, fe80::/10), but
+# two sit outside it: AWS answers IPv6 on the ULA fd00:ec2::254, and
+# Alibaba Cloud on 100.100.100.200 in the shared-address space. Neither
+# ``is_link_local`` nor ``is_private`` covers all of them, so they are
+# listed. No model endpoint is ever served from any of these, so a probe
+# refuses them. Loopback and RFC1918 stay allowed on purpose: a
+# self-hosted gateway on localhost or on the operator's LAN is a
+# first-class Creator setup. That makes this policy narrower than
+# safe_remote_download.require_public_ip, which rejects every non-global
+# address because it guards URLs a provider handed us, while these are
+# URLs the operator typed into the model form.
+_PROBE_ALLOWED_SCHEMES = frozenset({"http", "https"})
+_PROBE_METADATA_ADDRESSES = frozenset(
+    ipaddress.ip_address(address)
+    for address in (
+        "169.254.169.254",
+        "fd00:ec2::254",
+        "100.100.100.200",
+    )
+)
+
+
+def _reject_metadata_address(address: Any) -> None:
+    """Refuse an address that can only be a cloud metadata service."""
+    if address.is_link_local or address in _PROBE_METADATA_ADDRESSES:
+        raise ProbeDestinationError(
+            "模型 Base URL 不允许指向云元数据服务地址",
+        )
+
+
+def _reject_metadata_host(host: str) -> None:
+    """Refuse a literal metadata target before a request is built.
+
+    Only literal addresses are checked here. A hostname is judged by the
+    address its socket actually connected to (``_assert_probe_peer``),
+    which cannot be beaten by answering a pre-flight lookup with a public
+    address and the real one with a metadata address.
+    """
+    try:
+        address = ipaddress.ip_address(host.split("%", 1)[0])
+    except ValueError:
+        return
+    _reject_metadata_address(address)
+
+
+def _assert_probe_destination(url: str) -> None:
+    """Constrain where a probe may go, before it leaves the process.
+
+    A probe sends the configured API key as a bearer credential and
+    reports the response to whoever called it, so an unconstrained
+    ``base_url`` is a credential leak and an internal-network oracle at
+    the same time. An invalid port is left to httpx: it cannot turn a
+    probe inwards, and how an unusable Base URL fails is not this
+    policy's concern.
+    """
+    parsed = urlsplit(str(url or "").strip())
+    scheme = parsed.scheme.casefold()
+    if scheme not in _PROBE_ALLOWED_SCHEMES:
+        raise ProbeDestinationError(
+            f"模型 Base URL 必须是 http(s)，当前为 {scheme or '空'}",
+        )
+    host = parsed.hostname
+    if not host:
+        raise ProbeDestinationError("模型 Base URL 缺少主机名")
+    if parsed.username is not None or parsed.password is not None:
+        # Embedded credentials duplicate the bearer header, and a URL
+        # like "https://dashscope.aliyuncs.com@evil.example" reads as a
+        # trusted host to anyone skimming the probe log.
+        raise ProbeDestinationError("模型 Base URL 不允许携带用户名或密码")
+    _reject_metadata_host(host)
+
+
+def _assert_probe_peer(response: Any) -> None:
+    """Refuse a probe whose socket actually reached a metadata service.
+
+    The pre-flight check sees the URL, not the address DNS returned for
+    it, so a hostname can point at a public address while the connection
+    lands on the metadata service. The connected peer cannot lie about
+    that. A transport with no network stream (a test double, in-process
+    ASGI) exposes no peer and is skipped, as there is nothing to verify.
+    """
+    extensions = getattr(response, "extensions", None)
+    if not isinstance(extensions, dict):
+        return
+    stream = extensions.get("network_stream")
+    get_extra_info = getattr(stream, "get_extra_info", None)
+    if get_extra_info is None:
+        return
+    peer = get_extra_info("server_addr")
+    if not isinstance(peer, tuple) or not peer:
+        return
+    try:
+        address = ipaddress.ip_address(str(peer[0]).split("%", 1)[0])
+    except ValueError:
+        return
+    _reject_metadata_address(address)
+
+
 async def _send_probe(
     client: httpx.AsyncClient,
     url: str,
@@ -1893,20 +2010,28 @@ async def _send_probe(
     transcribes with), and anything else posts JSON. ``Content-Type`` is
     dropped for the first two: a GET carries no body, and httpx has to write
     the multipart boundary itself.
+
+    The destination is validated on the way out and the connected peer on
+    the way back, so every probe shape carries the same policy and a new
+    shape cannot forget it.
     """
+    _assert_probe_destination(url)
+    multipart = payload.pop("_multipart_probe", None)
     if payload.pop("_get_probe", False):
         headers.pop("Content-Type", None)
-        return await client.get(url, headers=headers, params=payload)
-    multipart = payload.pop("_multipart_probe", None)
-    if multipart is not None:
+        response = await client.get(url, headers=headers, params=payload)
+    elif multipart is not None:
         headers.pop("Content-Type", None)
-        return await client.post(
+        response = await client.post(
             url,
             headers=headers,
             data=multipart.get("data") or {},
             files=multipart.get("files") or {},
         )
-    return await client.post(url, headers=headers, json=payload)
+    else:
+        response = await client.post(url, headers=headers, json=payload)
+    _assert_probe_peer(response)
+    return response
 
 
 def _probe_headers(body: ModelConnectionTestRequest) -> dict[str, str]:
@@ -2146,7 +2271,13 @@ async def test_model_connection(
     start = time.monotonic()
     try:
         url, headers, payload = await _prepare_probe_payload(selected)
-        async with httpx.AsyncClient(timeout=30) as client:
+        # Explicit although already httpx's default: a redirect off the
+        # configured endpoint would carry the bearer key with it, and the
+        # probe would report a host the operator never named.
+        async with httpx.AsyncClient(
+            timeout=30,
+            follow_redirects=False,
+        ) as client:
             response = await _send_probe(client, url, headers, payload)
         elapsed = round((time.monotonic() - start) * 1000)
         if response.is_success and "minimax" in selected.protocol.casefold():
