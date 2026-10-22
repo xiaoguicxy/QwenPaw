@@ -119,6 +119,7 @@ vi.mock("./components/ProviderIconComponent", () => ({
 }));
 
 import ModelsPage from "./index";
+import styles from "./index.module.less";
 
 function makeProvider(overrides: Partial<ProviderInfo> = {}): ProviderInfo {
   return {
@@ -149,6 +150,29 @@ describe("ModelsPage", () => {
     vi.clearAllMocks();
     localStorage.clear();
     setProviders([]);
+  });
+
+  it("keeps the unified header for the home entry", () => {
+    renderWithProviders(<ModelsPage />, { initialEntries: ["/models"] });
+
+    const header = screen
+      .getByText("models.llmTitle")
+      .closest("[data-page-header]");
+    expect(header).not.toHaveClass(styles.pageHeader);
+    expect(screen.queryByText("nav.settings")).not.toBeInTheDocument();
+  });
+
+  it("keeps only the page title and the settings header style", () => {
+    renderWithProviders(<ModelsPage />, {
+      initialEntries: ["/settings/models"],
+    });
+
+    const header = screen
+      .getByText("models.llmTitle")
+      .closest("[data-page-header]");
+    expect(header).toHaveClass(styles.pageHeader);
+    expect(screen.queryByText("nav.settings")).not.toBeInTheDocument();
+    expect(screen.queryByText("models.scope.agent")).not.toBeInTheDocument();
   });
 
   it("shows the loading state while fetching", () => {
@@ -241,6 +265,23 @@ describe("ModelsPage", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("shows a search-specific empty state instead of setup guidance", async () => {
+    const user = userEvent.setup();
+    setProviders([
+      makeProvider({ id: "openai", name: "OpenAI", api_key: "sk-x" }),
+    ]);
+    renderWithProviders(<ModelsPage />, { initialEntries: ["/models"] });
+
+    const search = screen.getByPlaceholderText("models.searchPlaceholder");
+    await user.click(search);
+    await user.type(search, "missing");
+
+    await waitFor(() =>
+      expect(screen.getByText(/^models\.noSearchResults/)).toBeInTheDocument(),
+    );
+    expect(screen.queryByText("models.noConfigured")).not.toBeInTheDocument();
+  });
+
   it("refreshes providers via the refresh button", async () => {
     const user = userEvent.setup();
     setProviders([
@@ -322,16 +363,24 @@ describe("ModelsPage", () => {
     );
   });
 
-  it("renders the default LLM pill with the active model", () => {
+  it("renders the chat and decision model defaults", () => {
     setProviders(
       [makeProvider({ id: "openai", name: "OpenAI", api_key: "sk-x" })],
       {
         active_llm: { provider_id: "openai", model: "gpt-x" },
+        default_models: {
+          chat: { provider_id: "openai", model: "gpt-x" },
+          decision: null,
+        },
       },
     );
     renderWithProviders(<ModelsPage />, { initialEntries: ["/models"] });
-    expect(screen.getByText(/models\.defaultLlm/)).toBeInTheDocument();
-    expect(screen.getByText(/gpt-x/)).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "models.defaultChatModel" }),
+    ).toHaveTextContent("OpenAI / gpt-x");
+    expect(
+      screen.getByRole("button", { name: "models.defaultDecisionModel" }),
+    ).toHaveTextContent("models.notSet");
   });
 
   it("groups configured cloud providers by provider_group", () => {

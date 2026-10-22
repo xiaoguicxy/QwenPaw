@@ -24,6 +24,7 @@ from qwenpaw.providers.provider import (
     Provider,
 )
 
+from .adapters.request_context import with_session_header
 from .model_info import release_date
 from ..utils.io_utils import run_sync_io
 from .model_catalog import catalog_documents
@@ -114,7 +115,10 @@ def _http_error_detail(resp: httpx.Response) -> str:
 def _uses_max_completion_tokens(model_id: str) -> bool:
     """Return whether an OpenAI model requires max_completion_tokens."""
     model_name = model_id.strip().lower().rsplit("/", maxsplit=1)[-1]
-    return model_name.startswith("gpt-5") or (
+    gpt_version = re.match(r"gpt-([0-9]+)", model_name)
+    if gpt_version and int(gpt_version.group(1)) >= 5:
+        return True
+    return (
         len(model_name) > 1
         and model_name[0] == "o"
         and model_name[1].isdigit()
@@ -170,7 +174,11 @@ class OpenAIProvider(Provider):
         return self._build_default_headers()
 
     def _build_default_headers(self) -> dict:
-        return dict(self.custom_headers) if self.custom_headers else {}
+        return with_session_header(
+            dict(self.custom_headers) if self.custom_headers else {},
+            self.session_header_name,
+            self._request_session,
+        )
 
     def _client(self, timeout: float = 5) -> AsyncOpenAI:
         kwargs: dict = {
@@ -278,6 +286,16 @@ class OpenAIProvider(Provider):
                 message="Empty model ID",
             )
 
+        model = self.get_model_info(model_id)
+        if model is None:
+            model = self.get_discovered_model_info(model_id)
+        if model is not None and model.model_type == "decision":
+            success, message = await self.check_connection(timeout=timeout)
+            return ModelConnectionResult(
+                success=success,
+                message=message or "Only provider connectivity was checked",
+                verification="provider_only",
+            )
         if _is_non_chat_model(model_id):
             return await self._check_non_chat_model_connection(
                 model_id,
@@ -315,25 +333,25 @@ class OpenAIProvider(Provider):
             return ModelConnectionResult(success=True)
         except APIError as exc:
             detail = self.connection_error_message(exc)
-            if any(
+            dedicated_api = any(
                 marker in detail.lower()
                 for marker in _API_TYPE_MISMATCH_MARKERS
-            ):
-                return ModelConnectionResult(
-                    success=True,
-                    message=(
-                        f"Model '{model_id}' requires a dedicated non-chat "
-                        "API; endpoint and credentials verified"
-                    ),
-                )
+            )
             status = getattr(exc, "status_code", "unknown")
             return ModelConnectionResult(
-                success=False,
+                success=dedicated_api,
                 message=(
-                    f"API error when connecting to model '{model_id}' "
+                    f"Model '{model_id}' requires a dedicated non-chat "
+                    "API; endpoint and credentials verified"
+                    if dedicated_api
+                    else f"API error when connecting to model '{model_id}' "
                     f"(status={status}): {detail}"
                 ),
-                http_status=status if isinstance(status, int) else None,
+                http_status=(
+                    status
+                    if not dedicated_api and isinstance(status, int)
+                    else None
+                ),
             )
         except Exception as exc:
             return ModelConnectionResult(

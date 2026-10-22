@@ -297,6 +297,7 @@ function ACPPage() {
     setIsCreateMode(false);
     setActiveKey(key);
     setDrawerOpen(true);
+    form.resetFields();
     form.setFieldsValue({
       ...config,
       agentKey: key,
@@ -426,7 +427,7 @@ function ACPPage() {
     <div className={styles.channelsPage}>
       <PageHeader
         className={stylesACP.pageHeader}
-        items={[{ title: t("nav.agent") }, { title: t("acp.title") }]}
+        current={t("acp.title")}
         afterBreadcrumb={
           <InlineHelp>{`${t("acp.intro")} ${t(
             "acp.protocolHelp",

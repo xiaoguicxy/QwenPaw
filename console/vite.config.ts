@@ -2,6 +2,8 @@
 import { defineConfig, loadEnv, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
 import path from "path";
+import { startupMonitorPlugin } from "./scripts/startup-monitor-plugin";
+import { normalizeConsoleBasename } from "./src/utils/consoleBasename";
 
 // Vitest-only plugin: transforms .css imports inside node_modules to empty
 // stubs. This prevents errors from packages like @agentscope-ai/icons that
@@ -28,14 +30,23 @@ export default defineConfig(({ command, mode }) => {
   // Empty = same-origin; frontend and backend served together, no hardcoded host.
   // Use a dedicated Vite-prefixed key so unrelated shell BASE_URL values don't leak into the build.
   const apiBaseUrl = env.VITE_API_BASE_URL ?? "";
+  const consoleBasename = env.VITE_CONSOLE_BASENAME?.trim();
 
   return {
+    // Preserve root asset URLs for existing root and /console deployments.
+    base: consoleBasename
+      ? `${normalizeConsoleBasename(consoleBasename)}/`
+      : "/",
     define: {
       VITE_API_BASE_URL: JSON.stringify(apiBaseUrl),
       TOKEN: JSON.stringify(env.TOKEN || ""),
       MOBILE: false,
     },
-    plugins: [react(), ...(isVitest ? [cssStubPlugin] : [])],
+    plugins: [
+      react(),
+      startupMonitorPlugin(),
+      ...(isVitest ? [cssStubPlugin] : []),
+    ],
     css: {
       modules: {
         localsConvention: "camelCase",
