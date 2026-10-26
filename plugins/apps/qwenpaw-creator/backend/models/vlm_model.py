@@ -157,7 +157,11 @@ def _inline_payload(path: Path, fallback_mime: str) -> tuple[str, bytes]:
     downscaled = _downscale_image_to_budget(path, max_bytes)
     if downscaled is None:
         raise ModelError(
-            f"VLM local media inline size limit exceeded: {path.name} is {size} bytes, limit is {max_bytes}. A non-DashScope provider inlines media as Base64 and cannot fetch a DashScope OSS URL; raise VLM_MAX_INLINE_BYTES, shorten or downscale the source, or point the VLM at a DashScope endpoint.",
+            f"VLM local media inline size limit exceeded: {path.name} is "
+            f"{size} bytes, limit is {max_bytes}. A non-DashScope provider "
+            "inlines media as Base64 and cannot fetch a DashScope OSS URL; "
+            "raise VLM_MAX_INLINE_BYTES, shorten or downscale the source, "
+            "or point the VLM at a DashScope endpoint.",
             model_name=model_config.get_vlm_model_name(),
         )
     logger.info(

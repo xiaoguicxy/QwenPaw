@@ -152,6 +152,11 @@ def compact_conversation_history(
     # a long production exceed the hard budget even after all tools are gone.
     # The current request/notification batch is outside this history view.
     removed = 0
+    # Relief is a plain sum over list items and an elided slot contributes
+    # zero, so carry it across the loop instead of re-walking every message
+    # on each pass; json_bytes stays the loop's only full traversal, exactly
+    # as it was before inline media entered the budget.
+    relief = _inline_media_relief(result)
     for index, item in enumerate(result):
         human_input = (
             item.get("role") == "user"
@@ -159,9 +164,10 @@ def compact_conversation_history(
         )
         if human_input or index == latest_snapshot:
             continue
-        if _media_aware_bytes(result) <= max_bytes - 256:
+        if json_bytes(result) - relief <= max_bytes - 256:
             break
         result[index] = None
+        relief -= _inline_media_relief(item)
         removed += 1
     return [
         {

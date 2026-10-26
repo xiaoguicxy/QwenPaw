@@ -32,6 +32,22 @@ from services.runtime_files.models import CreatorMessageRecord
 
 _MEDIA_PART_TYPES = frozenset({"image_url", "video_url"})
 
+
+def _media_type_of(url: str, declared: str) -> str:
+    """Mime actually carried by *url*, falling back to *declared*.
+
+    An oversized page image is re-encoded as a downscaled JPEG on the
+    inline path, so the ``image/png`` a caller declares no longer
+    describes the payload. Consumers read the data URL header first, but
+    a stale sibling field is a trap for any that do not.
+    """
+    if url.startswith("data:"):
+        header, _, _ = url[5:].partition(";")
+        if header:
+            return header
+    return declared
+
+
 # DashScope rejects native video inputs shorter than about two seconds
 # ("The video file is too short"); such clips are delivered as an ordered
 # frame sequence instead.
@@ -498,17 +514,18 @@ async def document_page_content_parts(
             model_name=model_name,
             media_type="image/png",
         )
+        media_type = _media_type_of(public_url, "image/png")
         parts.append(
             {
                 "type": "image_url",
                 "image_url": {
                     "url": public_url,
-                    "mediaType": "image/png",
+                    "mediaType": media_type,
                     "page": page,
                 },
                 "attachment": {
                     "documentPageRef": str(ref),
-                    "mediaType": "image/png",
+                    "mediaType": media_type,
                 },
             },
         )

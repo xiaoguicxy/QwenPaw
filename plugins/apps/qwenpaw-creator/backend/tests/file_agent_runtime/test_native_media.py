@@ -658,6 +658,53 @@ def test_document_page_parts_inline_for_a_non_dashscope_provider(
     }
 
 
+def test_downscaled_document_page_reports_the_media_it_carries(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An oversized page inlines as JPEG, so mediaType has to follow.
+
+    The part builder declared ``image/png`` unconditionally while the
+    inline transport re-encodes an over-budget page as a downscaled
+    JPEG. Consumers read the data URL header first, so nothing breaks
+    today; the stale sibling field is exactly what this pins.
+    """
+
+    from services.source_analysis.service import (
+        document_page_path,
+        document_page_ref,
+    )
+
+    services = _project(tmp_path)
+    _inline_transport_config(monkeypatch)
+    project_root = services.projects.project_root("project-1")
+    checksum = "c" * 64
+    page_path = document_page_path(project_root, checksum, 1)
+    page_path.parent.mkdir(parents=True, exist_ok=True)
+    page_path.write_bytes(b"png-bytes")
+    ref = document_page_ref(checksum, 1)
+
+    async def downscaled_transport(_path, **_kwargs):
+        return "data:image/jpeg;base64," + base64.b64encode(b"j").decode()
+
+    monkeypatch.setattr(
+        native_media,
+        "transport_local_media_url",
+        downscaled_transport,
+    )
+
+    parts = asyncio.run(
+        native_media.document_page_content_parts(
+            services,
+            project_id="project-1",
+            tool_result={"pageImageRefs": [ref]},
+        ),
+    )
+
+    assert parts[0]["image_url"]["mediaType"] == "image/jpeg"
+    assert parts[0]["attachment"]["mediaType"] == "image/jpeg"
+
+
 def test_video_frame_parts_inline_for_a_non_dashscope_provider(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,

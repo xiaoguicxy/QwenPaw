@@ -35,6 +35,8 @@ from services.file_agent_runtime.model_client import (
 from services.file_agent_runtime import model_client
 from services.file_agent_runtime.model_context import (
     ModelContextBudgetError,
+    _inline_media_relief,
+    compact_conversation_history,
     prepare_model_messages,
 )
 
@@ -168,6 +170,74 @@ def test_long_production_compacts_automatic_history_but_keeps_human_input():
             ],
             [],
         )
+
+
+def test_inline_media_relief_is_additive_across_elided_slots():
+    """Compaction carries relief incrementally, which needs additivity.
+
+    ``compact_conversation_history`` no longer re-walks every message to
+    recompute relief on each pass; it subtracts the item it just elided.
+    That is only exact because relief sums over list items and an elided
+    slot is worth zero, so the invariant itself is what this guards.
+    """
+    encoded = base64.b64encode(b"\x00" * (512 * 1024)).decode()
+    media = {
+        "type": "image_url",
+        "image_url": {"url": f"data:image/jpeg;base64,{encoded}"},
+    }
+    first = {"role": "user", "content": [media]}
+    second = {"role": "user", "content": [media, media]}
+    plain = {"role": "user", "content": "plain text"}
+    history = [first, second, plain]
+
+    whole = _inline_media_relief(history)
+    assert whole == sum(_inline_media_relief(item) for item in history)
+    assert _inline_media_relief(None) == 0
+
+    elided = [first, None, plain]
+    assert _inline_media_relief(elided) == whole - _inline_media_relief(
+        second,
+    )
+
+
+def test_media_bearing_automatic_history_is_elided_under_budget():
+    """Droppable reviews that carry inline media must actually leave.
+
+    Pins the budget accounting where relief changes mid-loop. If the
+    carried total were left un-decremented, ``json_bytes`` would shrink
+    while relief stayed huge, the check would go negative, and
+    compaction would stop after the first message — handing the provider
+    a request still over budget instead of reaching it.
+    """
+    encoded = base64.b64encode(b"\x00" * (512 * 1024)).decode()
+    media = {
+        "type": "image_url",
+        "image_url": {"url": f"data:image/jpeg;base64,{encoded}"},
+    }
+    history = [
+        {
+            "role": "user",
+            "source": "initial_goal",
+            "content": [{"type": "text", "text": "保留全部六集与对白"}],
+        },
+    ]
+    for index in range(6):
+        history.append(
+            {
+                "role": "user",
+                "source": "run_review_feedback",
+                "content": [
+                    {"type": "text", "text": f"review-{index}"},
+                    media,
+                ],
+            },
+        )
+
+    result = compact_conversation_history(history, max_bytes=4096)
+
+    assert result[0]["source"] == "context_compaction"
+    assert result[0]["elidedMessageCount"] == 6
+    assert [item.get("source") for item in result[1:]] == ["initial_goal"]
 
 
 @pytest.mark.parametrize(
