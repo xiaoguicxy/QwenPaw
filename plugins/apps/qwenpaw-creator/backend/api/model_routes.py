@@ -1025,7 +1025,11 @@ async def _validate_section_connectivity(
             url, headers, payload = await _prepare_probe_payload(probe)
             if payload.pop("_get_probe", False):
                 headers.pop("Content-Type", None)
-                resp = await client.get(url, headers=headers, params=payload)
+                resp = await client.get(
+                    url,
+                    headers=headers,
+                    params=_non_secret_probe_params(payload, api_key),
+                )
             else:
                 resp = await client.post(url, headers=headers, json=payload)
             if not resp.is_success:
@@ -1837,6 +1841,60 @@ def _gemini_llm_probe(
     return url, headers, payload
 
 
+def _probe_target_refusal(
+    probed_base_url: str,
+    model_type: str,
+    *,
+    supplied_key: str,
+    key_home_base_url: str,
+) -> str:
+    """Return a user-facing refusal when the probe target must not be used.
+
+    ``/models/test`` deliberately accepts an unsaved ``base_url`` so an
+    operator can check an edited config before persisting it.  That is safe
+    while the credential also comes from the request - the caller already
+    holds it - and unsafe the moment the route reaches into its own stored
+    configuration: the caller would then be steering a *saved* secret to any
+    host it picked (CWE-522).  A stored key may therefore only travel to the
+    host it was saved for; a key handed over by this request keeps the
+    freedom to test any http(s) address.
+    """
+    parsed = urlparse(probed_base_url)
+    if parsed.scheme not in {"http", "https"}:
+        return (
+            f"配置不完整：{model_type} 的 Base URL 必须使用 http 或 https 协议"
+            f"（当前: {parsed.scheme or '未指定'}）。"
+        )
+    if supplied_key:
+        return ""
+    stored_host = (urlparse(key_home_base_url).hostname or "").casefold()
+    target_host = (parsed.hostname or "").casefold()
+    if stored_host and target_host != stored_host:
+        return (
+            "安全限制：本次探测会使用已保存的 API Key，但目标地址与该 Key 保存时的"
+            f" Host 不一致（已保存: {stored_host}，本次请求: "
+            f"{target_host or '未指定'}）。"
+            "请先保存模型配置后再测试，或在配置弹窗中重新填写新地址的 API Key。"
+        )
+    return ""
+
+
+def _non_secret_probe_params(
+    payload: dict[str, Any],
+    api_key: str,
+) -> dict[str, Any]:
+    """Keep the credential out of query strings.
+
+    A GET probe sends its payload as URL parameters, and query strings end up
+    in provider access logs, intermediaries and browser history.  No builder
+    puts the key in the parameters today; this drops any value that *is* the
+    key so a future builder cannot regress it.
+    """
+    if not api_key:
+        return payload
+    return {key: value for key, value in payload.items() if value != api_key}
+
+
 async def _prepare_probe_payload(
     body: ModelConnectionTestRequest,
 ) -> tuple[str, dict[str, str], dict[str, Any]]:
@@ -2065,12 +2123,17 @@ async def test_model_connection(
     loaded = await asyncio.to_thread(load_model_config)
     item = getattr(loaded, body.type)
     fallback_api_key = item.api_key
+    # The host the fallback credential was saved for; a saved key may only
+    # travel to it (see _probe_target_refusal).
+    key_home_base_url = item.base_url
     if (
         body.type in ("asr", "tts", "s2v", "image", "video")
         and getattr(item, "reuse_llm_key", False)
         and not fallback_api_key
     ):
         fallback_api_key = loaded.llm.api_key
+        # A reused LLM key belongs to the LLM endpoint, not to this section.
+        key_home_base_url = loaded.llm.base_url
     request_api_key = "" if body.api_key == SECRET_MASK else body.api_key
     selected = body.model_copy(
         update={
@@ -2099,6 +2162,14 @@ async def test_model_connection(
                 "请在模型配置弹窗中补齐后重试。"
             ),
         )
+    refusal = _probe_target_refusal(
+        selected.base_url,
+        body.type,
+        supplied_key=request_api_key,
+        key_home_base_url=key_home_base_url,
+    )
+    if refusal:
+        return ConnectionTestResponse(ok=False, ms=0, error=refusal)
     start = time.monotonic()
     try:
         url, headers, payload = await _prepare_probe_payload(selected)
@@ -2108,7 +2179,7 @@ async def test_model_connection(
                 response = await client.get(
                     url,
                     headers=headers,
-                    params=payload,
+                    params=_non_secret_probe_params(payload, selected.api_key),
                 )
             else:
                 response = await client.post(
