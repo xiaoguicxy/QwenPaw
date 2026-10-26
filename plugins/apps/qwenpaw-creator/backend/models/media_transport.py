@@ -652,6 +652,29 @@ async def _cached_platform_media_upload(
         return url
 
 
+def reference_transport_needs_upload_key(
+    base_url: str,
+    protocol: str = "",
+) -> bool:
+    """True when the reference transport for *base_url* must present a key.
+
+    Both remote transports need one: the AgentScope proxy's own media upload
+    and the DashScope model-bound temporary OSS. Only the inline Base64
+    fallback is keyless. A caller that guards on the credential has to
+    mirror the routing below, otherwise an uncredentialed request reaches a
+    remote upload and is answered with 401.
+    """
+    # Local import: vlm_model imports this module at module level.
+    from models.vlm_model import uses_dashscope_transport
+
+    if model_config.is_agentscope_gateway(
+        protocol=protocol,
+        base_url=base_url,
+    ):
+        return True
+    return uses_dashscope_transport(base_url)
+
+
 async def upload_reference_file_for_provider(
     path: Path,
     *,
@@ -663,10 +686,13 @@ async def upload_reference_file_for_provider(
 ) -> str:
     """Return a URL the configured provider can fetch for one local file.
 
-    Single decision point for the two reference transports, so a call site
+    Single decision point for the three reference transports, so a call site
     never has to know which storage the endpoint behind it accepts: the
     AgentScope proxy has no Bailian upload identity and takes its own public
-    URL, everything else keeps the model-bound ``oss://`` temporary upload.
+    URL, a DashScope endpoint keeps the model-bound ``oss://`` temporary
+    upload, and any other OpenAI-compatible gateway is served the bytes
+    inline, because it can neither fetch a DashScope OSS object nor accept a
+    Bailian upload credential.
     """
     if model_config.is_agentscope_gateway(
         protocol=protocol,
@@ -677,6 +703,21 @@ async def upload_reference_file_for_provider(
             api_key=api_key,
             base_url=base_url,
             media_type=media_type,
+        )
+    if not reference_transport_needs_upload_key(base_url, protocol):
+        from models.vlm_model import (  # local import: see above
+            transport_local_media_url,
+        )
+
+        # Reuse the VLM inline path so the size budget and the downscaling
+        # ladder apply here too; a raw Base64 of a 200MB clip would otherwise
+        # be assembled without limit.
+        return await transport_local_media_url(
+            path,
+            api_key=api_key,
+            model_name=model_name,
+            media_type=media_type,
+            base_url=base_url,
         )
     return await upload_local_file_to_dashscope_temp(
         path,

@@ -8,10 +8,13 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import io
 import json
 from contextlib import asynccontextmanager
 
 import pytest
+from PIL import Image
 
 from models import vlm_model
 from utils.exceptions import ModelError
@@ -81,6 +84,163 @@ def test_local_media_transport_dashscope_temp_and_data_url_fallback(
         "type": "image_url",
         "image_url": {"url": "data:image/png;base64,cG5n"},
     }
+
+
+def test_oversized_image_is_downscaled_instead_of_refused(
+    tmp_path,
+    monkeypatch,
+):
+    """An image over the inline budget is re-encoded, not refused.
+
+    Providers bill vision tokens rather than request bytes, so a downscaled
+    image still answers the question whereas a hard refusal leaves the
+    understanding record silently empty.
+    """
+
+    image = tmp_path / "large.bmp"
+    # BMP is uncompressed, so the byte size is predictable.
+    Image.new("RGB", (1200, 1200), color="blue").save(image, format="BMP")
+    assert image.stat().st_size > 64 * 1024
+
+    monkeypatch.setattr(
+        vlm_model.model_config,
+        "get_vlm_max_inline_bytes",
+        lambda: 64 * 1024,
+    )
+    monkeypatch.setattr(
+        vlm_model.model_config,
+        "get_vlm_model_name",
+        lambda: "gpt-vision",
+    )
+
+    url = vlm_model._data_url(image, "image/png")
+
+    assert url.startswith("data:image/jpeg;base64,")
+    payload = base64.b64decode(url.split(",", 1)[1])
+    assert len(payload) <= 64 * 1024
+    # The re-encoded image is still decodable and carries real pixels.
+    with Image.open(io.BytesIO(payload)) as decoded:
+        assert decoded.size[0] > 0 and decoded.size[1] > 0
+
+
+def test_downscaled_image_is_rotated_to_match_exif_orientation(
+    tmp_path,
+    monkeypatch,
+):
+    """Re-encoding must not leave a portrait phone photo on its side.
+
+    ``thumbnail`` + ``save`` drops the EXIF Orientation tag, so the pixels
+    have to be rotated first: otherwise the VLM is handed a frame that no
+    viewer would render the way the camera captured it.
+    """
+
+    image = tmp_path / "portrait.jpg"
+    # 1200x400 pixels stored sideways, tagged "rotate 90 CW" like a phone.
+    frame = Image.new("RGB", (1200, 400), color="blue")
+    exif = frame.getexif()
+    exif[0x0112] = 6
+    frame.save(image, format="JPEG", exif=exif)
+    assert image.stat().st_size > 4096
+
+    monkeypatch.setattr(
+        vlm_model.model_config,
+        "get_vlm_max_inline_bytes",
+        lambda: 4096,
+    )
+    monkeypatch.setattr(
+        vlm_model.model_config,
+        "get_vlm_model_name",
+        lambda: "gpt-vision",
+    )
+
+    url = vlm_model._data_url(image, "image/jpeg")
+
+    payload = base64.b64decode(url.split(",", 1)[1])
+    assert len(payload) <= 4096
+    with Image.open(io.BytesIO(payload)) as decoded:
+        # Upright portrait, with no tag left to contradict the pixels.
+        assert decoded.size[1] > decoded.size[0]
+        assert decoded.getexif().get(0x0112) is None
+
+
+def test_downscale_composites_transparency_onto_white(tmp_path):
+    """A screenshot's transparent background must not come back black.
+
+    Dropping the alpha channel keeps whatever the encoder stored under the
+    transparent pixels, which for a UI capture is black: the page would
+    reach the VLM as pale text on black. Opaque content keeps its colour.
+    """
+
+    image = tmp_path / "screenshot.png"
+    # Fully transparent canvas whose stored RGB is black, plus dark "text".
+    frame = Image.new("RGBA", (64, 64), color=(0, 0, 0, 0))
+    text = Image.new("RGBA", (32, 8), color=(20, 20, 20, 255))
+    frame.paste(text, (16, 28))
+    frame.save(image, format="PNG")
+
+    payload = vlm_model._downscale_image_to_budget(image, 64 * 1024)
+
+    assert payload is not None
+    with Image.open(io.BytesIO(payload)) as decoded:
+        assert decoded.mode == "RGB"
+        # The transparent corner was composited onto white, not black.
+        assert min(decoded.getpixel((0, 0))) > 180
+        # The opaque text survived the composite instead of washing out.
+        assert max(decoded.getpixel((32, 32))) < 120
+
+
+def test_flatten_alpha_covers_every_mode_that_carries_transparency():
+    """LA and palette transparency take the same white-composite path.
+
+    A screenshot is RGBA, but a scanned page can arrive as LA and a legacy
+    asset as a palette with a transparent index. All three must composite;
+    an image without alpha is merely converted.
+    """
+
+    white = (255, 255, 255)
+    rgba = Image.new("RGBA", (4, 4), color=(0, 0, 0, 0))
+    assert vlm_model._flatten_alpha(rgba).getpixel((0, 0)) == white
+
+    grey = Image.new("LA", (4, 4), color=(0, 0))
+    assert vlm_model._flatten_alpha(grey).getpixel((0, 0)) == white
+
+    palette = Image.new("P", (4, 4), color=0)
+    palette.putpalette([0, 0, 0, 20, 20, 20] + [0] * (254 * 3))
+    # Index 0 is the transparent one, and it stores black underneath.
+    palette.info["transparency"] = 0
+    assert vlm_model._flatten_alpha(palette).getpixel((0, 0)) == white
+
+    opaque = Image.new("L", (4, 4), color=30)
+    assert vlm_model._flatten_alpha(opaque).getpixel((0, 0)) == (30, 30, 30)
+
+    # A palette without a transparent index has nothing to composite.
+    solid = Image.new("P", (4, 4), color=1)
+    solid.putpalette([0, 0, 0, 40, 40, 40] + [0] * (254 * 3))
+    assert vlm_model._flatten_alpha(solid).getpixel((0, 0)) == (40, 40, 40)
+
+
+def test_oversized_non_image_media_still_refused_with_guidance(
+    tmp_path,
+    monkeypatch,
+):
+    """A clip cannot be downscaled here, so the refusal must say what to do."""
+
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"\x00" * 4096)
+
+    monkeypatch.setattr(
+        vlm_model.model_config,
+        "get_vlm_max_inline_bytes",
+        lambda: 1024,
+    )
+    monkeypatch.setattr(
+        vlm_model.model_config,
+        "get_vlm_model_name",
+        lambda: "gpt-vision",
+    )
+
+    with pytest.raises(ModelError, match="VLM_MAX_INLINE_BYTES"):
+        vlm_model._data_url(clip, "video/mp4")
 
 
 def test_chat_completion_preserves_mixed_content_parts_in_request(monkeypatch):

@@ -9,13 +9,17 @@
 from __future__ import annotations
 
 import asyncio
+import io
+import ipaddress
 import json
 import os
 import re
+import tempfile
 import time
+import wave
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit
 
 import httpx
 from fastapi import APIRouter, Body, Header, Query, Request, Response, status
@@ -1020,14 +1024,16 @@ async def _validate_section_connectivity(
         provider=item.get("provider"),
     )
 
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with httpx.AsyncClient(
+        timeout=30,
+        # A probe must reach the configured endpoint, not wherever it is
+        # waved on to: following a redirect would let a public host bounce
+        # the bearer credential into the internal network.
+        follow_redirects=False,
+    ) as client:
         try:
-            url, headers, payload = await _prepare_probe_payload(probe)
-            if payload.pop("_get_probe", False):
-                headers.pop("Content-Type", None)
-                resp = await client.get(url, headers=headers, params=payload)
-            else:
-                resp = await client.post(url, headers=headers, json=payload)
+            probe_request = await _prepare_probe_payload(probe)
+            resp = await _send_probe(client, *probe_request)
             if not resp.is_success:
                 try:
                     body = resp.json()
@@ -1056,6 +1062,12 @@ async def _validate_section_connectivity(
                 f"{section}: 连接超时，请检查网络或 Base URL",
             )
         except httpx.HTTPError as exc:
+            raise ValidationError(f"{section}: {exc}")
+        except RuntimeError as exc:
+            # The ASR probe uploads its silent sample before it can ask
+            # anything, and the uploader reports a refused credential or a
+            # malformed policy as a RuntimeError. That is a connection
+            # finding about this section, not a fault of the config route.
             raise ValidationError(f"{section}: {exc}")
 
 
@@ -1837,9 +1849,164 @@ def _gemini_llm_probe(
     return url, headers, payload
 
 
+# One second of silence exercises a transcription route for a fraction of a
+# cent. It is built in-process rather than shelled out to ffmpeg so the probe
+# also works in a container that has no ffmpeg installed.
+_ASR_PROBE_SAMPLE_SECONDS = 1.0
+_ASR_PROBE_SAMPLE_RATE = 16_000
+
+
+def _silent_wav_bytes() -> bytes:
+    """A silent mono 16 kHz WAV payload for the ASR capability probe.
+
+    Silence transcribes to an empty string, so this asserts that the route
+    accepts and processes real audio, not that any words came back.
+    """
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(_ASR_PROBE_SAMPLE_RATE)
+        frames = int(_ASR_PROBE_SAMPLE_RATE * _ASR_PROBE_SAMPLE_SECONDS)
+        handle.writeframes(b"\x00\x00" * frames)
+    return buffer.getvalue()
+
+
+def _asr_provider(body: ModelConnectionTestRequest) -> str:
+    """Which route ``asr_model.transcribe`` will actually take.
+
+    Mirrors that dispatch exactly: the stored provider decides whisper,
+    then a ``qwen3-asr*`` model name, then Fun-ASR. ``protocol`` is
+    deliberately not consulted, because ``get_asr_provider()`` does not
+    read it either: a config whose protocol says Whisper while its
+    provider says Fun-ASR runs the Fun-ASR route, and probing the whisper
+    one would green-light an endpoint production never calls. Probing a
+    different route than the one production runs is how a dead endpoint
+    stayed green, and the previous probe never produced ``qwen3-asr`` at
+    all — a qwen3-asr config was validated against the Fun-ASR
+    upload-policy call.
+    """
+    if (body.provider or "").casefold() == "whisper":
+        return "whisper"
+    if (body.model_name or "").casefold().startswith("qwen3-asr"):
+        return "qwen3-asr"
+    return "fun-asr"
+
+
+async def _upload_asr_probe_sample(
+    body: ModelConnectionTestRequest,
+) -> str:
+    """Upload the silent sample; return the URL the ASR route will fetch.
+
+    Uses the same model-bound temporary OSS upload production uses, so a
+    probe that passes has exercised the upload half of the real chain too,
+    and one that fails has failed for a reason production would also hit.
+    """
+    from models.media_transport import upload_local_file_to_dashscope_temp
+
+    with tempfile.TemporaryDirectory(prefix="creator-asr-probe-") as raw:
+        sample = Path(raw) / "creator-probe.wav"
+        await asyncio.to_thread(sample.write_bytes, _silent_wav_bytes())
+        return await upload_local_file_to_dashscope_temp(
+            sample,
+            api_key=body.api_key,
+            model_name=body.model_name,
+            media_type="audio/wav",
+        )
+
+
+async def _asr_probe(
+    body: ModelConnectionTestRequest,
+) -> tuple[str, dict[str, str], dict[str, Any]]:
+    """Transcribe one second of silence through the production ASR route.
+
+    ASR was the only tier whose connection test measured something other
+    than what it green-lit: ``GET /models/{id}`` proves the key and the
+    registry entry, and the DashScope upload-policy call proves neither, so a
+    platform answering 500 on ``audio/transcriptions``, 404 on
+    ``asr/transcription`` and 502 on ``multimodal-generation`` still showed a
+    green test while every real transcription failed. llm/vlm, tts and
+    embedding already pay for a real request; this brings ASR in line.
+    """
+    # Route derivation is imported rather than restated so the probe cannot
+    # drift from the endpoints production actually calls.
+    from models.asr_model import (
+        _FUN_ASR_TRANSCRIPTION_SUFFIX,
+        _fun_asr_base,
+        _qwen3_endpoint,
+    )
+
+    headers = _probe_headers(body)
+    provider = _asr_provider(body)
+    if provider == "whisper":
+        # Same multipart shape as asr_model._whisper. Content-Type stays in
+        # the returned headers for _send_probe to drop, as with _get_probe.
+        base = body.base_url.rstrip("/")
+        return (
+            f"{base}/audio/transcriptions",
+            headers,
+            {
+                "_multipart_probe": {
+                    "data": {
+                        "model": body.model_name,
+                        "response_format": "verbose_json",
+                    },
+                    "files": {
+                        "file": (
+                            "creator-probe.wav",
+                            _silent_wav_bytes(),
+                            "audio/wav",
+                        ),
+                    },
+                },
+            },
+        )
+    file_url = await _upload_asr_probe_sample(body)
+    if provider == "qwen3-asr":
+        return (
+            _qwen3_endpoint(body.base_url),
+            {**headers, "X-DashScope-OssResourceResolve": "enable"},
+            {
+                "model": body.model_name,
+                "input": {
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [{"audio": file_url}],
+                        },
+                    ],
+                },
+                "parameters": {"result_format": "message"},
+            },
+        )
+    # Fun-ASR: the real async submit, with the headers production sends —
+    # omitting X-DashScope-Async is what made an earlier attempt at this
+    # probe come back 403 "does not support asynchronous calls". The probe
+    # deliberately does not poll the task, because a UI button needs bounded
+    # latency, so what it asserts is that the transcription route exists,
+    # accepts the key and takes the work. A worker that dies mid-task is
+    # still invisible here.
+    fun_base = _fun_asr_base(body.base_url)
+    return (
+        f"{fun_base}/{_FUN_ASR_TRANSCRIPTION_SUFFIX}",
+        {
+            **headers,
+            "X-DashScope-Async": "enable",
+            "X-DashScope-OssResourceResolve": "enable",
+        },
+        {
+            "model": body.model_name,
+            "input": {"file_urls": [file_url]},
+            "parameters": {},
+        },
+    )
+
+
 async def _prepare_probe_payload(
     body: ModelConnectionTestRequest,
 ) -> tuple[str, dict[str, str], dict[str, Any]]:
+    if body.type == "asr":
+        return await _asr_probe(body)
     url, headers, payload = _probe_payload(body)
     if body.type in {"llm", "vlm"} and model_config.is_anthropic_protocol(
         body.protocol,
@@ -1854,17 +2021,179 @@ async def _prepare_probe_payload(
     return url, headers, payload
 
 
+class ProbeDestinationError(ValueError):
+    """A probe target violated the destination policy.
+
+    Subclasses ``ValueError`` on purpose: ``test_model_connection`` catches
+    ``(httpx.HTTPError, ValueError, RuntimeError)`` and renders the message
+    as an ``ok=False`` diagnostic. ``domain.errors.ValidationError`` is not
+    a ``ValueError``, so raising that instead would make the endpoint whose
+    job is explaining a broken configuration answer with a 500.
+    """
+
+
+# Cloud metadata services hand instance credentials to anything that asks.
+# Most answer from the link-local range (169.254.169.254, fe80::/10), but
+# two sit outside it: AWS answers IPv6 on the ULA fd00:ec2::254, and
+# Alibaba Cloud on 100.100.100.200 in the shared-address space. Neither
+# ``is_link_local`` nor ``is_private`` covers all of them, so they are
+# listed. No model endpoint is ever served from any of these, so a probe
+# refuses them. Loopback and RFC1918 stay allowed on purpose: a
+# self-hosted gateway on localhost or on the operator's LAN is a
+# first-class Creator setup. That makes this policy narrower than
+# safe_remote_download.require_public_ip, which rejects every non-global
+# address because it guards URLs a provider handed us, while these are
+# URLs the operator typed into the model form.
+_PROBE_ALLOWED_SCHEMES = frozenset({"http", "https"})
+_PROBE_METADATA_ADDRESSES = frozenset(
+    ipaddress.ip_address(address)
+    for address in (
+        "169.254.169.254",
+        "fd00:ec2::254",
+        "100.100.100.200",
+    )
+)
+
+
+def _reject_metadata_address(address: Any) -> None:
+    """Refuse an address that can only be a cloud metadata service."""
+    if address.is_link_local or address in _PROBE_METADATA_ADDRESSES:
+        raise ProbeDestinationError(
+            "模型 Base URL 不允许指向云元数据服务地址",
+        )
+
+
+def _reject_metadata_host(host: str) -> None:
+    """Refuse a literal metadata target before a request is built.
+
+    Only literal addresses are checked here. A hostname is judged by the
+    address its socket actually connected to (``_assert_probe_peer``),
+    which cannot be beaten by answering a pre-flight lookup with a public
+    address and the real one with a metadata address.
+    """
+    try:
+        address = ipaddress.ip_address(host.split("%", 1)[0])
+    except ValueError:
+        return
+    _reject_metadata_address(address)
+
+
+def _assert_probe_destination(url: str) -> None:
+    """Constrain where a probe may go, before it leaves the process.
+
+    A probe sends the configured API key as a bearer credential and
+    reports the response to whoever called it, so an unconstrained
+    ``base_url`` is a credential leak and an internal-network oracle at
+    the same time. An invalid port is left to httpx: it cannot turn a
+    probe inwards, and how an unusable Base URL fails is not this
+    policy's concern.
+    """
+    parsed = urlsplit(str(url or "").strip())
+    scheme = parsed.scheme.casefold()
+    if scheme not in _PROBE_ALLOWED_SCHEMES:
+        raise ProbeDestinationError(
+            f"模型 Base URL 必须是 http(s)，当前为 {scheme or '空'}",
+        )
+    host = parsed.hostname
+    if not host:
+        raise ProbeDestinationError("模型 Base URL 缺少主机名")
+    if parsed.username is not None or parsed.password is not None:
+        # Embedded credentials duplicate the bearer header, and a URL
+        # like "https://dashscope.aliyuncs.com@evil.example" reads as a
+        # trusted host to anyone skimming the probe log.
+        raise ProbeDestinationError("模型 Base URL 不允许携带用户名或密码")
+    _reject_metadata_host(host)
+
+
+def _assert_probe_peer(response: Any) -> None:
+    """Refuse a probe whose socket actually reached a metadata service.
+
+    The pre-flight check sees the URL, not the address DNS returned for
+    it, so a hostname can point at a public address while the connection
+    lands on the metadata service. The connected peer cannot lie about
+    that. A transport with no network stream (a test double, in-process
+    ASGI) exposes no peer and is skipped, as there is nothing to verify.
+
+    Known limit: when httpx reaches the endpoint through an HTTP proxy the
+    peer is the proxy, so this attests to the proxy's address rather than
+    the final host's. Switching the client to ``trust_env=False`` is not
+    the remedy, because a deployment that only reaches its gateway through
+    a configured proxy would then fail its connection test outright, and
+    the probed Base URL is operator-entered configuration rather than
+    user input.
+    """
+    extensions = getattr(response, "extensions", None)
+    if not isinstance(extensions, dict):
+        return
+    stream = extensions.get("network_stream")
+    get_extra_info = getattr(stream, "get_extra_info", None)
+    if get_extra_info is None:
+        return
+    peer = get_extra_info("server_addr")
+    if not isinstance(peer, tuple) or not peer:
+        return
+    try:
+        address = ipaddress.ip_address(str(peer[0]).split("%", 1)[0])
+    except ValueError:
+        return
+    _reject_metadata_address(address)
+
+
+async def _send_probe(
+    client: httpx.AsyncClient,
+    url: str,
+    headers: dict[str, str],
+    payload: dict[str, Any],
+) -> httpx.Response:
+    """Send one probe in whichever shape the probe asked for.
+
+    ``_get_probe`` selects a GET with query params, ``_multipart_probe``
+    selects a multipart/form-data POST (the shape OpenAI-compatible ASR
+    transcribes with), and anything else posts JSON. ``Content-Type`` is
+    dropped for the first two: a GET carries no body, and httpx has to write
+    the multipart boundary itself.
+
+    The destination is validated on the way out and the connected peer on
+    the way back, so every probe shape carries the same policy and a new
+    shape cannot forget it.
+    """
+    _assert_probe_destination(url)
+    multipart = payload.pop("_multipart_probe", None)
+    if payload.pop("_get_probe", False):
+        headers.pop("Content-Type", None)
+        response = await client.get(url, headers=headers, params=payload)
+    elif multipart is not None:
+        headers.pop("Content-Type", None)
+        response = await client.post(
+            url,
+            headers=headers,
+            data=multipart.get("data") or {},
+            files=multipart.get("files") or {},
+        )
+    else:
+        response = await client.post(url, headers=headers, json=payload)
+    _assert_probe_peer(response)
+    return response
+
+
+def _probe_headers(body: ModelConnectionTestRequest) -> dict[str, str]:
+    """Auth headers shared by every probe shape.
+
+    Send the credential whenever one is present so paid models behind a
+    free-tier-capable provider still authenticate; ``require_api_key``
+    only controls whether an *absent* key is tolerated (validated by the
+    route before probing).
+    """
+    headers: dict[str, str] = {"Content-Type": "application/json"}
+    if body.api_key:
+        headers["Authorization"] = f"Bearer {body.api_key}"
+    return headers
+
+
 def _probe_payload(
     body: ModelConnectionTestRequest,
 ) -> tuple[str, dict[str, str], dict[str, Any]]:
-    base = body.base_url.rstrip("/")
-    headers: dict[str, str] = {"Content-Type": "application/json"}
-    # Send the credential whenever one is present so paid models behind a
-    # free-tier-capable provider still authenticate; ``require_api_key``
-    # only controls whether an *absent* key is tolerated (validated by the
-    # route before probing).
-    if body.api_key:
-        headers["Authorization"] = f"Bearer {body.api_key}"
+    headers = _probe_headers(body)
     if body.type in {"llm", "vlm", "image", "asr", "tts"} and (
         model_config.is_agentscope_gateway(
             protocol=body.protocol,
@@ -1875,12 +2204,12 @@ def _probe_payload(
         # rejects an unknown model id before anything leaves the machine.
         return _gateway_models_probe(body, headers)
     if body.type == "asr":
-        provider = body.provider or (
-            "whisper" if "whisper" in body.protocol.casefold() else "fun-asr"
-        )
-        if provider == "whisper":
-            return _openai_model_probe(body, headers)
-        return _dashscope_policy_probe(body, headers)
+        # ASR is dispatched to the async _asr_probe, which uploads a sample
+        # first. Falling through here would silently return the generic
+        # upload-policy default — a route production never calls — and a test
+        # asserting on it would pass while measuring nothing.
+        raise ValueError("ASR probes must go through _prepare_probe_payload")
+    base = body.base_url.rstrip("/")
     if body.type == "tts":
         # The upload-policy probe accepts any model string, so it cannot catch a
         # mistyped model name. Synthesizing one character costs a fraction of a
@@ -2102,20 +2431,14 @@ async def test_model_connection(
     start = time.monotonic()
     try:
         url, headers, payload = await _prepare_probe_payload(selected)
-        async with httpx.AsyncClient(timeout=30) as client:
-            if payload.pop("_get_probe", False):
-                headers.pop("Content-Type", None)
-                response = await client.get(
-                    url,
-                    headers=headers,
-                    params=payload,
-                )
-            else:
-                response = await client.post(
-                    url,
-                    headers=headers,
-                    json=payload,
-                )
+        # Explicit although already httpx's default: a redirect off the
+        # configured endpoint would carry the bearer key with it, and the
+        # probe would report a host the operator never named.
+        async with httpx.AsyncClient(
+            timeout=30,
+            follow_redirects=False,
+        ) as client:
+            response = await _send_probe(client, url, headers, payload)
         elapsed = round((time.monotonic() - start) * 1000)
         if response.is_success and "minimax" in selected.protocol.casefold():
             # MiniMax hides auth/balance failures inside an HTTP 200; without
@@ -2194,7 +2517,9 @@ async def test_model_connection(
                 f"连接超时，请检查网络或 Base URL" f"（当前 Base URL: {selected.base_url}）"
             ),
         )
-    except (httpx.HTTPError, ValueError) as exc:
+    except (httpx.HTTPError, ValueError, RuntimeError) as exc:
+        # RuntimeError covers the ASR probe's sample upload, which refuses an
+        # absent credential or a malformed policy before any probe is sent.
         return ConnectionTestResponse(
             ok=False,
             ms=round((time.monotonic() - start) * 1000),

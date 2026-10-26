@@ -26,12 +26,14 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
 import mimetypes
 import time
 from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
+from PIL import Image, ImageOps
 
 from models import config as model_config
 from models.concurrency import model_slot
@@ -52,6 +54,18 @@ logger = setup_logger("model.vlm")
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
 VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v", ".webm", ".avi", ".mkv"}
 
+# Inline images step down this ladder (longest edge in px, JPEG quality)
+# until the encoded bytes fit VLM_MAX_INLINE_BYTES. Providers bill vision
+# tokens rather than request bytes, so a downscaled image still answers the
+# question whereas a hard refusal leaves the understanding record silently
+# empty. Mirrors the video clip ladder in services.media.source_observation.
+IMAGE_INLINE_LADDER = (
+    (2048, 85),
+    (1536, 80),
+    (1024, 75),
+    (768, 70),
+)
+
 
 def _mime_for_path(path: Path, fallback: str) -> str:
     return mimetypes.guess_type(path.name)[0] or fallback
@@ -65,30 +79,119 @@ def _local_path_from_url(url: str) -> Path | None:
     return None
 
 
-def _data_url(path: Path, fallback_mime: str) -> str:
-    size = path.stat().st_size
+# EXIF Orientation values that need a pixel transform. 1 and a missing tag
+# both mean the stored pixels are already upright.
+_EXIF_ORIENTATION_TAG = 0x0112
+
+
+def _upright(image: Image.Image) -> Image.Image:
+    """Bake EXIF Orientation into the pixels.
+
+    Re-encoding drops the tag, so without this a portrait phone photo reaches
+    the VLM lying on its side: the only hint that viewers should rotate it is
+    gone from the JPEG we hand over.
+    """
+    orientation = image.getexif().get(_EXIF_ORIENTATION_TAG)
+    if isinstance(orientation, int) and 2 <= orientation <= 8:
+        return ImageOps.exif_transpose(image)
+    return image
+
+
+def _flatten_alpha(image: Image.Image) -> Image.Image:
+    """Composite transparent pixels onto white before dropping the alpha.
+
+    ``convert("RGB")`` discards the alpha channel and keeps whatever the
+    encoder stored underneath the transparent pixels — usually black. UI
+    captures and scanned documents are exactly the images that outgrow the
+    inline budget, so without this a transparent-background page reaches the
+    VLM as pale text on black, the one rendering it reads worst.
+    """
+    if image.mode == "RGB":
+        return image
+    has_alpha = image.mode in {"RGBA", "LA"} or (
+        image.mode == "P" and "transparency" in image.info
+    )
+    if not has_alpha:
+        return image.convert("RGB")
+    rgba = image.convert("RGBA")
+    flat = Image.new("RGB", rgba.size, (255, 255, 255))
+    flat.paste(rgba, mask=rgba.getchannel("A"))
+    return flat
+
+
+def _downscale_image_to_budget(path: Path, max_bytes: int) -> bytes | None:
+    """Re-encode *path* down the ladder until it fits *max_bytes*.
+
+    Returns ``None`` when the file is not a decodable image, or when even the
+    smallest rung stays over budget, so callers keep their existing refusal.
+
+    The catch below is deliberately broad, and narrowing it would be a
+    regression: PIL raises ``DecompressionBombError`` for a file over its
+    pixel ceiling, and that type derives from ``Exception`` rather than
+    ``OSError``, so an ``(OSError, ValueError)`` clause would let an
+    oversized screenshot escape instead of reaching the refusal.
+    """
+    try:
+        with Image.open(path) as image:
+            image.load()
+            image = _upright(image)
+            image = _flatten_alpha(image)
+            for max_edge, quality in IMAGE_INLINE_LADDER:
+                frame = image.copy()
+                frame.thumbnail((max_edge, max_edge), Image.LANCZOS)
+                buffer = io.BytesIO()
+                frame.save(
+                    buffer,
+                    format="JPEG",
+                    quality=quality,
+                    optimize=True,
+                )
+                payload = buffer.getvalue()
+                if len(payload) <= max_bytes:
+                    return payload
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.info("inline downscale unavailable for %s (%s)", path.name, exc)
+        return None
+    return None
+
+
+def _inline_payload(path: Path, fallback_mime: str) -> tuple[str, bytes]:
+    """Return ``(mime, bytes)`` for *path*, downscaled to fit the budget."""
     max_bytes = model_config.get_vlm_max_inline_bytes()
-    if size > max_bytes:
+    size = path.stat().st_size
+    if size <= max_bytes:
+        return _mime_for_path(path, fallback_mime), path.read_bytes()
+    downscaled = _downscale_image_to_budget(path, max_bytes)
+    if downscaled is None:
         raise ModelError(
-            f"VLM local media inline size limit exceeded: {path.name} is {size} bytes, limit is {max_bytes}",
+            f"VLM local media inline size limit exceeded: {path.name} is "
+            f"{size} bytes, limit is {max_bytes}. A non-DashScope provider "
+            "inlines media as Base64 and cannot fetch a DashScope OSS URL; "
+            "raise VLM_MAX_INLINE_BYTES, shorten or downscale the source, "
+            "or point the VLM at a DashScope endpoint.",
             model_name=model_config.get_vlm_model_name(),
         )
-    encoded = base64.b64encode(path.read_bytes()).decode("utf-8")
-    return f"data:{_mime_for_path(path, fallback_mime)};base64,{encoded}"
+    logger.info(
+        "inlined %s as a downscaled JPEG: %d bytes exceeds the %d-byte VLM "
+        "inline budget, re-encoded to %d bytes",
+        path.name,
+        size,
+        max_bytes,
+        len(downscaled),
+    )
+    return "image/jpeg", downscaled
+
+
+def _data_url(path: Path, fallback_mime: str) -> str:
+    mime, payload = _inline_payload(path, fallback_mime)
+    encoded = base64.b64encode(payload).decode("utf-8")
+    return f"data:{mime};base64,{encoded}"
 
 
 def _inline_base64(path: Path, fallback_mime: str) -> tuple[str, str]:
     """Return ``(mime_type, base64_data)`` for a local file."""
-    size = path.stat().st_size
-    max_bytes = model_config.get_vlm_max_inline_bytes()
-    if size > max_bytes:
-        raise ModelError(
-            f"VLM local media inline size limit exceeded: {path.name} is {size} bytes, limit is {max_bytes}",
-            model_name=model_config.get_vlm_model_name(),
-        )
-    mime = _mime_for_path(path, fallback_mime)
-    data = base64.b64encode(path.read_bytes()).decode("utf-8")
-    return mime, data
+    mime, payload = _inline_payload(path, fallback_mime)
+    return mime, base64.b64encode(payload).decode("utf-8")
 
 
 def multimodal_media_part(
@@ -177,11 +280,48 @@ def _is_dashscope_provider(base_url: str) -> bool:
     return "dashscope" in host
 
 
-def uses_dashscope_transport() -> bool:
-    """True when the configured VLM transports local media through the
-    DashScope model-bound temporary OSS upload (48h TTL, <=1GB) instead
-    of inline Base64 data URLs."""
-    return _is_dashscope_provider(model_config.get_vlm_base_url())
+def uses_dashscope_transport(base_url: str = "") -> bool:
+    """True when local media travels through the DashScope model-bound
+    temporary OSS upload (48h TTL, <=1GB) instead of inline Base64 URLs.
+
+    *base_url* names the endpoint the caller is about to upload for and
+    defaults to the configured VLM. Passing it stops this predicate from
+    disagreeing with the transport the caller actually chose.
+    """
+    return _is_dashscope_provider(base_url or model_config.get_vlm_base_url())
+
+
+async def transport_local_media_url(
+    local_path: Path,
+    *,
+    api_key: str,
+    model_name: str,
+    media_type: str = "",
+    base_url: str = "",
+) -> str:
+    """Return a URL for *local_path* that the configured VLM can ingest.
+
+    Callers that assemble multimodal parts themselves — the file-native
+    Specialist media pipeline — never reach ``_call_openai_vlm``, so the
+    provider decision has to happen where the part is created. DashScope
+    uploads to the model-bound temporary OSS and yields a public URL; every
+    other OpenAI-compatible gateway receives an inline Base64 data URL,
+    because it cannot fetch DashScope's OSS object and answers the DashScope
+    upload credential with 401.
+    """
+    fallback = media_type or (
+        "video/mp4"
+        if local_path.suffix.lower() in VIDEO_SUFFIXES
+        else "image/png"
+    )
+    if uses_dashscope_transport(base_url):
+        return await upload_local_file_to_dashscope_temp(
+            local_path,
+            api_key=api_key,
+            model_name=model_name,
+            media_type=media_type or _mime_for_path(local_path, fallback),
+        )
+    return await asyncio.to_thread(_data_url, local_path, fallback)
 
 
 async def _transport_local_media_part(

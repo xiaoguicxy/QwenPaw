@@ -505,3 +505,65 @@ def test_agentscope_predicate_never_trusts_a_lookalike_url() -> None:
         protocol="DashScope（百炼）",
         base_url="https://dashscope.aliyuncs.com/api/v1",
     )
+
+
+def test_file_dispatcher_inlines_for_a_plain_openai_gateway(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """A third endpoint shape: neither the proxy nor DashScope gets the bytes.
+
+    Neither remote upload works here - the Bailian credential is not this
+    gateway's, and it cannot fetch an ``oss://`` object - so reaching for one
+    is not a slower route but a guaranteed failure of media understanding.
+    """
+    media = tmp_path / "ref.png"
+    media.write_bytes(b"png-bytes")
+    calls: list[str] = []
+
+    async def forbidden_platform(path, **_kwargs):
+        calls.append("platform")
+        raise AssertionError("the proxy upload is not reachable here")
+
+    async def forbidden_temp(path, **_kwargs):
+        calls.append("dashscope")
+        raise AssertionError("the Bailian upload is not reachable here")
+
+    monkeypatch.setattr(
+        media_transport,
+        "upload_local_file_to_platform_media",
+        forbidden_platform,
+    )
+    monkeypatch.setattr(
+        media_transport,
+        "upload_local_file_to_dashscope_temp",
+        forbidden_temp,
+    )
+
+    url = asyncio.run(
+        media_transport.upload_reference_file_for_provider(
+            media,
+            api_key="",
+            model_name="gpt-vision",
+            media_type="image/png",
+            base_url="https://api.openai.example/v1",
+        ),
+    )
+
+    assert url.startswith("data:image/png;base64,")
+    assert base64.b64decode(url.split(",", 1)[1]) == b"png-bytes"
+    assert not calls
+
+
+def test_reference_upload_key_predicate_mirrors_the_three_routes() -> None:
+    """Every remote transport presents a credential; only inlining does not.
+
+    A caller that guards on the key has to agree with the dispatcher, or an
+    uncredentialed request reaches a remote upload and is answered 401.
+    """
+    needs = media_transport.reference_transport_needs_upload_key
+
+    assert needs("https://platform-pre.agentscope.io/v1")
+    assert needs("https://gateway.internal/v1", "AgentScope Platform")
+    assert needs("https://dashscope.aliyuncs.com/api/v1")
+    assert not needs("https://api.openai.example/v1")
