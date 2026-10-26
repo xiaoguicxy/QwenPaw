@@ -7,9 +7,16 @@ by the DashScope gateway with 403; probes use free read-only APIs.
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
-from api.model_routes import _minimax_base_resp_error, _probe_payload
+from api.model_routes import (
+    _minimax_base_resp_error,
+    _non_secret_probe_params,
+    _probe_payload,
+    _probe_target_refusal,
+)
 from schemas.models import ModelConnectionTestRequest
 
 
@@ -448,3 +455,146 @@ def test_gemini_vlm_probe_converts_image_to_inline_data() -> None:
     assert len(parts) == 2
     assert parts[0] == {"text": "Reply with red only."}
     assert parts[1]["inline_data"]["mime_type"] == "image/png"
+
+
+# ---------------------------------------------------------------------------
+# CWE-522: the probe must not launder a saved credential toward a foreign host
+# ---------------------------------------------------------------------------
+
+
+def _stub_saved_config(
+    monkeypatch,
+    *,
+    saved_base_url: str,
+    saved_key: str,
+) -> None:
+    """Pretend the operator already saved one provider endpoint + secret."""
+    from api import model_routes
+
+    class _Item:
+        api_key = saved_key
+        base_url = saved_base_url
+        model_name = "glm-5"
+        protocol = "OpenAI Chat"
+        provider = None
+        voice = ""
+        reuse_llm_key = False
+
+    class _Config:
+        llm = _Item()
+        vlm = _Item()
+        asr = _Item()
+        tts = _Item()
+        s2v = _Item()
+        image = _Item()
+        video = _Item()
+        embedding = _Item()
+
+    monkeypatch.setattr(model_routes, "load_model_config", _Config)
+
+
+def test_saved_key_is_never_sent_to_a_request_selected_host(
+    monkeypatch,
+) -> None:
+    """Masked key + foreign Base URL would post the stored secret elsewhere."""
+    from api import model_routes
+
+    _stub_saved_config(
+        monkeypatch,
+        saved_base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        saved_key="sk-saved",
+    )
+
+    def _no_dispatch(*args, **kwargs):
+        raise AssertionError("the probe must not be dispatched at all")
+
+    monkeypatch.setattr(model_routes.httpx, "AsyncClient", _no_dispatch)
+    request = ModelConnectionTestRequest(
+        type="llm",
+        base_url="https://collector.example.net/v1",
+        api_key=model_routes.SECRET_MASK,
+        model_name="glm-5",
+        protocol="OpenAI Chat",
+        provider=None,
+        require_api_key=True,
+    )
+
+    response = asyncio.run(model_routes.test_model_connection(request))
+
+    assert not response.ok
+    assert "安全限制" in response.error
+    assert "collector.example.net" in response.error
+
+
+@pytest.mark.parametrize(
+    ("supplied_key", "probed", "home", "want_refusal"),
+    [
+        # The caller already holds this key, so testing a brand-new gateway
+        # against it stays possible - that is the point of this endpoint.
+        (
+            "sk-typed",
+            "https://gateway.example.com/v1",
+            "https://dashscope.aliyuncs.com/v1",
+            False,
+        ),
+        # Same host, different path: the compatible-mode and api roots are
+        # one endpoint family, and the key belongs to both.
+        (
+            "",
+            "https://dashscope.aliyuncs.com/api/v1",
+            "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            False,
+        ),
+        # Host comparison is case-insensitive.
+        (
+            "",
+            "https://DASHSCOPE.aliyuncs.com/v1",
+            "https://dashscope.aliyuncs.com/v1",
+            False,
+        ),
+        # A saved key may not travel to a host chosen per-request.
+        (
+            "",
+            "http://127.0.0.1:9999/v1",
+            "https://dashscope.aliyuncs.com/v1",
+            True,
+        ),
+    ],
+)
+def test_probe_target_guard_boundaries(
+    supplied_key,
+    probed,
+    home,
+    want_refusal,
+) -> None:
+    refusal = _probe_target_refusal(
+        probed,
+        "llm",
+        supplied_key=supplied_key,
+        key_home_base_url=home,
+    )
+
+    assert bool(refusal) is want_refusal
+
+
+def test_probe_target_guard_rejects_non_http_targets() -> None:
+    refusal = _probe_target_refusal(
+        "file:///etc/passwd",
+        "llm",
+        supplied_key="sk-typed",
+        key_home_base_url="",
+    )
+
+    assert "http" in refusal
+
+
+def test_get_probe_params_never_carry_the_credential() -> None:
+    params = _non_secret_probe_params(
+        {"model": "fun-asr", "token": "sk-secret", "flag": "false"},
+        "sk-secret",
+    )
+
+    assert params == {"model": "fun-asr", "flag": "false"}
+    assert _non_secret_probe_params({"model": "fun-asr"}, "") == {
+        "model": "fun-asr",
+    }
