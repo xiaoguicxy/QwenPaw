@@ -1753,8 +1753,14 @@ def _gateway_models_probe(
     Every other probe for these sections issues a real completion (even at
     ``max_tokens=8``), which on this gateway both spends Credits and cannot
     tell a bad credential from an empty balance: running out of Credits is
-    answered with a 403 that reads like a permission failure. The model list
-    validates the key and the allowlist in one free request.
+    answered with a 403 that reads like a permission failure.
+
+    What the free list proves is narrower than it looks: nothing here reads
+    the response body, so a gateway that answers 200 while its registered
+    models leave out the configured one — or while every transcription route
+    behind it is dead — still passes. The verdict is about the credential
+    alone, and ``capability_verified`` is what carries that distinction to
+    the card.
     """
     parsed = urlparse(body.base_url)
     url = f"{parsed.scheme}://{parsed.netloc}/v1/models"
@@ -2431,6 +2437,10 @@ async def test_model_connection(
     start = time.monotonic()
     try:
         url, headers, payload = await _prepare_probe_payload(selected)
+        # Read the marker before sending: _send_probe pops it to choose the
+        # verb, and a GET is precisely the probe that cannot attest to more
+        # than the credential being accepted.
+        capability_verified = "_get_probe" not in payload
         # Explicit although already httpx's default: a redirect off the
         # configured endpoint would carry the bearer key with it, and the
         # probe would report a host the operator never named.
@@ -2458,6 +2468,7 @@ async def test_model_connection(
                 ok=True,
                 ms=elapsed,
                 detail="provider accepted the probe",
+                capability_verified=capability_verified,
             )
         try:
             provider_body = response.json()
