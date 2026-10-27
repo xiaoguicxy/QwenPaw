@@ -356,6 +356,88 @@ def test_connection_test_reports_a_metadata_target_as_a_failure(
     assert "元数据" in response.error
 
 
+class _AcceptingResponse:
+    """A provider reply that took the probe, without touching the network."""
+
+    is_success = True
+
+    def json(self) -> dict:
+        return {}
+
+
+class _ProbeConfig(_EmptyAsrConfig):
+    """The first-run config above, plus the section a read-only probe needs."""
+
+    image = _EmptyAsrConfig._Item()
+
+
+def _accepted_connection_test(
+    request: ModelConnectionTestRequest,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Run the whole endpoint against a provider that always accepts.
+
+    The probe is prepared by the real routing code, because which verb it
+    ends up using is the thing under test; only the socket is replaced.
+    """
+
+    async def fake_send(client, url, headers, payload):
+        del client, url, headers, payload
+        return _AcceptingResponse()
+
+    monkeypatch.setattr(model_routes, "load_model_config", _ProbeConfig)
+    monkeypatch.setattr(model_routes, "_send_probe", fake_send)
+    return asyncio.run(model_routes.test_model_connection(request))
+
+
+def test_connection_test_marks_a_real_request_as_capability_verified(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A posted completion proves the modality answers, not just the key."""
+
+    result = _accepted_connection_test(
+        _request(
+            type="llm",
+            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+            model_name="qwen-plus",
+            protocol="OpenAI 协议",
+            provider=None,
+        ),
+        monkeypatch,
+    )
+
+    assert result.ok
+    assert result.capability_verified is True
+
+
+def test_connection_test_marks_a_read_only_probe_as_credential_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A free GET cannot show that a broken generation route got fixed.
+
+    A model listing answers 200 for any valid key while keeping non-text
+    models invisible, which is exactly how three dead ASR routes stayed
+    green. Marking that pass as credential-level is what stops the UI from
+    claiming a capability this test never exercised.
+    """
+
+    result = _accepted_connection_test(
+        _request(
+            type="image",
+            base_url=(
+                "https://token-plan.cn-beijing.maas.aliyuncs.com/api/v1"
+            ),
+            model_name="wan2.7-image-pro",
+            protocol="Aliyun Token Plan",
+            provider=None,
+        ),
+        monkeypatch,
+    )
+
+    assert result.ok
+    assert result.capability_verified is False
+
+
 def test_section_validator_reports_a_refused_probe_upload(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

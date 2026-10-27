@@ -2279,6 +2279,10 @@ async def test_model_connection(
     start = time.monotonic()
     try:
         url, headers, payload = await _prepare_probe_payload(selected)
+        # Read the marker before sending: _send_probe pops it to choose the
+        # verb, and a GET is precisely the probe that cannot attest to more
+        # than the credential being accepted.
+        capability_verified = "_get_probe" not in payload
         # Explicit although already httpx's default: a redirect off the
         # configured endpoint would carry the bearer key with it, and the
         # probe would report a host the operator never named.
@@ -2306,6 +2310,7 @@ async def test_model_connection(
                 ok=True,
                 ms=elapsed,
                 detail="provider accepted the probe",
+                capability_verified=capability_verified,
             )
         try:
             provider_body = response.json()
