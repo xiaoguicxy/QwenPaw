@@ -1979,6 +1979,14 @@ def _assert_probe_peer(response: Any) -> None:
     lands on the metadata service. The connected peer cannot lie about
     that. A transport with no network stream (a test double, in-process
     ASGI) exposes no peer and is skipped, as there is nothing to verify.
+
+    Known limit: when httpx reaches the endpoint through an HTTP proxy the
+    peer is the proxy, so this attests to the proxy's address rather than
+    the final host's. Switching the client to ``trust_env=False`` is not
+    the remedy, because a deployment that only reaches its gateway through
+    a configured proxy would then fail its connection test outright, and
+    the probed Base URL is operator-entered configuration rather than
+    user input.
     """
     extensions = getattr(response, "extensions", None)
     if not isinstance(extensions, dict):

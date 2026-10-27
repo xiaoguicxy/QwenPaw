@@ -123,6 +123,12 @@ def _downscale_image_to_budget(path: Path, max_bytes: int) -> bytes | None:
 
     Returns ``None`` when the file is not a decodable image, or when even the
     smallest rung stays over budget, so callers keep their existing refusal.
+
+    The catch below is deliberately broad, and narrowing it would be a
+    regression: PIL raises ``DecompressionBombError`` for a file over its
+    pixel ceiling, and that type derives from ``Exception`` rather than
+    ``OSError``, so an ``(OSError, ValueError)`` clause would let an
+    oversized screenshot escape instead of reaching the refusal.
     """
     try:
         with Image.open(path) as image:
