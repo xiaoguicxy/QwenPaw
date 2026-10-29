@@ -5,9 +5,14 @@ Submitting real tasks (ASR/video) as a "ping" is billable and rejected
 by the DashScope gateway with 403; probes use free read-only APIs.
 """
 
+# pylint: disable=unused-argument
+# The stub transport below mirrors the httpx call signature so the route under
+# test can pass `params=` / `json=` exactly as it would on the wire.
+
 from __future__ import annotations
 
 import asyncio
+import types
 
 import pytest
 
@@ -462,35 +467,88 @@ def test_gemini_vlm_probe_converts_image_to_inline_data() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _stub_saved_config(
-    monkeypatch,
-    *,
-    saved_base_url: str,
-    saved_key: str,
-) -> None:
-    """Pretend the operator already saved one provider endpoint + secret."""
+_SECTIONS = (
+    "llm",
+    "vlm",
+    "asr",
+    "tts",
+    "s2v",
+    "image",
+    "video",
+    "embedding",
+)
+
+
+def _stub_saved_config(monkeypatch, **sections: dict) -> None:
+    """Pretend the operator already saved these provider endpoints.
+
+    ``_stub_saved_config(monkeypatch, llm={"base_url": ..., "api_key": ...})``;
+    a section left out reads as unsaved.
+    """
     from api import model_routes
 
-    class _Item:
-        api_key = saved_key
-        base_url = saved_base_url
-        model_name = "glm-5"
-        protocol = "OpenAI Chat"
-        provider = None
-        voice = ""
-        reuse_llm_key = False
+    defaults = {
+        "base_url": "",
+        "api_key": "",
+        "model_name": "glm-5",
+        "protocol": "OpenAI Chat",
+        "provider": None,
+        "voice": "",
+        "reuse_llm_key": False,
+        "reuse_vlm_key": False,
+    }
+    saved = {
+        name: types.SimpleNamespace(
+            **{**defaults, **sections.get(name, {})},
+        )
+        for name in _SECTIONS
+    }
 
-    class _Config:
-        llm = _Item()
-        vlm = _Item()
-        asr = _Item()
-        tts = _Item()
-        s2v = _Item()
-        image = _Item()
-        video = _Item()
-        embedding = _Item()
+    def _load_saved():
+        return types.SimpleNamespace(**saved)
 
-    monkeypatch.setattr(model_routes, "load_model_config", _Config)
+    monkeypatch.setattr(model_routes, "load_model_config", _load_saved)
+
+
+def _no_dispatch_client(monkeypatch) -> None:
+    """Make any outbound probe fail the test instead of reaching a socket."""
+    from api import model_routes
+
+    def _factory(*args, **kwargs):
+        raise AssertionError("the probe must not be dispatched at all")
+
+    monkeypatch.setattr(model_routes.httpx, "AsyncClient", _factory)
+
+
+def _capture_dispatch(monkeypatch) -> list:
+    """Record the URL and headers a probe would send, then report success."""
+    from api import model_routes
+
+    sent: list[tuple[str, dict[str, str]]] = []
+
+    class _Response:
+        is_success = True
+
+    class _Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc_info):
+            return False
+
+        async def get(self, url, headers=None, params=None):
+            sent.append((str(url), dict(headers or {})))
+            return _Response()
+
+        async def post(self, url, headers=None, json=None):
+            sent.append((str(url), dict(headers or {})))
+            return _Response()
+
+    monkeypatch.setattr(model_routes.httpx, "AsyncClient", _Client)
+    return sent
 
 
 def test_saved_key_is_never_sent_to_a_request_selected_host(
@@ -501,14 +559,12 @@ def test_saved_key_is_never_sent_to_a_request_selected_host(
 
     _stub_saved_config(
         monkeypatch,
-        saved_base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-        saved_key="sk-saved",
+        llm={
+            "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            "api_key": "sk-saved",
+        },
     )
-
-    def _no_dispatch(*args, **kwargs):
-        raise AssertionError("the probe must not be dispatched at all")
-
-    monkeypatch.setattr(model_routes.httpx, "AsyncClient", _no_dispatch)
+    _no_dispatch_client(monkeypatch)
     request = ModelConnectionTestRequest(
         type="llm",
         base_url="https://collector.example.net/v1",
@@ -527,51 +583,107 @@ def test_saved_key_is_never_sent_to_a_request_selected_host(
 
 
 @pytest.mark.parametrize(
-    ("supplied_key", "probed", "home", "want_refusal"),
+    ("supplied_key", "stored_key", "probed", "homes", "want_refusal"),
     [
         # The caller already holds this key, so testing a brand-new gateway
         # against it stays possible - that is the point of this endpoint.
         (
             "sk-typed",
+            "",
             "https://gateway.example.com/v1",
-            "https://dashscope.aliyuncs.com/v1",
+            ("https://dashscope.aliyuncs.com/v1",),
             False,
         ),
-        # Same host, different path: the compatible-mode and api roots are
+        # Same origin, different path: the compatible-mode and api roots are
         # one endpoint family, and the key belongs to both.
         (
             "",
+            "sk-saved",
             "https://dashscope.aliyuncs.com/api/v1",
-            "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            ("https://dashscope.aliyuncs.com/compatible-mode/v1",),
             False,
         ),
         # Host comparison is case-insensitive.
         (
             "",
+            "sk-saved",
             "https://DASHSCOPE.aliyuncs.com/v1",
-            "https://dashscope.aliyuncs.com/v1",
+            ("https://dashscope.aliyuncs.com/v1",),
             False,
         ),
         # A saved key may not travel to a host chosen per-request.
         (
             "",
+            "sk-saved",
             "http://127.0.0.1:9999/v1",
-            "https://dashscope.aliyuncs.com/v1",
+            ("https://dashscope.aliyuncs.com/v1",),
+            True,
+        ),
+        # ... nor one scheme downgrade away, where it would leave in cleartext.
+        (
+            "",
+            "sk-saved",
+            "http://dashscope.aliyuncs.com/v1",
+            ("https://dashscope.aliyuncs.com/v1",),
+            True,
+        ),
+        # ... nor to another service listening on the same host.
+        (
+            "",
+            "sk-saved",
+            "http://127.0.0.1:8000/v1",
+            ("http://127.0.0.1:11434/v1",),
+            True,
+        ),
+        # ``casefold()`` reads these two as equal; HTTPX resolves them to
+        # different domains, so the guard must not treat them as one home.
+        (
+            "",
+            "sk-saved",
+            "https://aßistant.example/v1",
+            ("https://assistant.example/v1",),
+            True,
+        ),
+        # An explicit port must match the saved one, defaults included.
+        (
+            "",
+            "sk-saved",
+            "https://dashscope.aliyuncs.com:443/v1",
+            ("https://dashscope.aliyuncs.com/v1",),
+            False,
+        ),
+        # Nothing is being sent, so there is nothing to bind: a keyless probe
+        # is a plain URL check.
+        (
+            "",
+            "",
+            "http://127.0.0.1:11434/v1",
+            ("http://localhost:11434/v1",),
+            False,
+        ),
+        # A credential with no recorded home must not borrow the request's.
+        (
+            "",
+            "sk-env",
+            "https://other.example/v1",
+            ("",),
             True,
         ),
     ],
 )
 def test_probe_target_guard_boundaries(
     supplied_key,
+    stored_key,
     probed,
-    home,
+    homes,
     want_refusal,
 ) -> None:
     refusal = _probe_target_refusal(
         probed,
         "llm",
         supplied_key=supplied_key,
-        key_home_base_url=home,
+        stored_key=stored_key,
+        trusted_base_urls=homes,
     )
 
     assert bool(refusal) is want_refusal
@@ -582,10 +694,197 @@ def test_probe_target_guard_rejects_non_http_targets() -> None:
         "file:///etc/passwd",
         "llm",
         supplied_key="sk-typed",
-        key_home_base_url="",
+        stored_key="",
+        trusted_base_urls=(),
     )
 
     assert "http" in refusal
+
+
+def test_probe_target_guard_survives_an_unparseable_url() -> None:
+    """A malformed address is a config error, never an escaping ValueError."""
+    refusal = _probe_target_refusal(
+        "https://[::1",
+        "llm",
+        supplied_key="sk-typed",
+        stored_key="",
+        trusted_base_urls=("https://[::1",),
+    )
+
+    assert "配置不完整" in refusal
+
+
+def test_malformed_probe_url_returns_a_config_error_not_a_500(
+    monkeypatch,
+) -> None:
+    """The guard parses before the route's try block, so it must not raise."""
+    from api import model_routes
+
+    _stub_saved_config(
+        monkeypatch,
+        llm={
+            "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            "api_key": "sk-saved",
+        },
+    )
+    _no_dispatch_client(monkeypatch)
+    request = ModelConnectionTestRequest(
+        type="asr",
+        base_url="https://[::1",
+        api_key="sk-test",
+        model_name="fun-asr",
+        protocol="DashScope Fun-ASR",
+        provider="fun-asr",
+    )
+
+    response = asyncio.run(model_routes.test_model_connection(request))
+
+    assert not response.ok
+    assert "配置不完整" in response.error
+
+
+def test_keyless_probe_of_another_host_still_reaches_the_provider(
+    monkeypatch,
+) -> None:
+    """With no credential anywhere, testing a local server is not a leak."""
+    from api import model_routes
+
+    _stub_saved_config(
+        monkeypatch,
+        llm={"base_url": "http://localhost:11434/v1", "api_key": ""},
+    )
+    sent = _capture_dispatch(monkeypatch)
+    request = ModelConnectionTestRequest(
+        type="llm",
+        base_url="http://127.0.0.1:11434/v1",
+        api_key="",
+        model_name="llama3",
+        protocol="OpenAI Chat",
+        provider=None,
+        require_api_key=False,
+    )
+
+    response = asyncio.run(model_routes.test_model_connection(request))
+
+    assert response.ok
+    assert len(sent) == 1
+    assert sent[0][0].startswith("http://127.0.0.1:11434")
+    assert "Authorization" not in sent[0][1]
+
+
+def test_environment_key_without_a_saved_home_is_refused(
+    monkeypatch,
+) -> None:
+    """A key with no recorded origin must not adopt the request's target."""
+    from api import model_routes
+
+    _stub_saved_config(monkeypatch, llm={"base_url": "", "api_key": "sk-env"})
+    _no_dispatch_client(monkeypatch)
+    request = ModelConnectionTestRequest(
+        type="llm",
+        base_url="https://other.example/v1",
+        api_key="",
+        model_name="glm-5",
+        protocol="OpenAI Chat",
+        provider=None,
+    )
+
+    response = asyncio.run(model_routes.test_model_connection(request))
+
+    assert not response.ok
+    assert "没有记录归属地址" in response.error
+
+
+@pytest.mark.parametrize(
+    ("section", "owner", "owner_key", "model_name", "protocol"),
+    [
+        ("asr", "llm", "sk-llm", "whisper-1", "OpenAI Whisper"),
+        (
+            "embedding",
+            "vlm",
+            "sk-vlm",
+            "qwen3-vl-embedding",
+            "DashScope Multimodal",
+        ),
+    ],
+)
+def test_saved_cross_host_key_reuse_still_probes_its_own_host(
+    monkeypatch,
+    section,
+    owner,
+    owner_key,
+    model_name,
+    protocol,
+) -> None:
+    """An operator-saved reuse pair is authorised, per each half's own host.
+
+    The route previously re-anchored a reused key to the owner endpoint only,
+    which refused a config that was already saved and never edited by this
+    request - and the hint to "save it first" could not help, because it was.
+    """
+    from api import model_routes
+
+    saved_owner = {
+        "base_url": f"https://{owner}.example/v1",
+        "api_key": owner_key,
+    }
+    saved_section = {
+        "base_url": "https://media.example/v1",
+        "api_key": "",
+        "model_name": model_name,
+        "protocol": protocol,
+        "reuse_llm_key": section == "asr",
+        "reuse_vlm_key": section == "embedding",
+    }
+    _stub_saved_config(
+        monkeypatch,
+        **{owner: saved_owner, section: saved_section},
+    )
+    sent = _capture_dispatch(monkeypatch)
+    request = ModelConnectionTestRequest(
+        type=section,
+        base_url="",
+        api_key="",
+        model_name=model_name,
+        protocol=protocol,
+        provider=None,
+    )
+
+    response = asyncio.run(model_routes.test_model_connection(request))
+
+    assert response.ok, response.error
+    assert len(sent) == 1
+    assert sent[0][0].startswith("https://media.example")
+    assert sent[0][1]["Authorization"] == f"Bearer {owner_key}"
+
+
+def test_saved_key_is_not_tricked_by_an_idna_lookalike_host(
+    monkeypatch,
+) -> None:
+    """A lookalike host that casefolds to the saved one is still foreign."""
+    from api import model_routes
+
+    _stub_saved_config(
+        monkeypatch,
+        llm={
+            "base_url": "https://assistant.example/v1",
+            "api_key": "sk-saved",
+        },
+    )
+    _no_dispatch_client(monkeypatch)
+    request = ModelConnectionTestRequest(
+        type="llm",
+        base_url="https://aßistant.example/v1",
+        api_key=model_routes.SECRET_MASK,
+        model_name="glm-5",
+        protocol="OpenAI Chat",
+        provider=None,
+    )
+
+    response = asyncio.run(model_routes.test_model_connection(request))
+
+    assert not response.ok
+    assert "安全限制" in response.error
 
 
 def test_get_probe_params_never_carry_the_credential() -> None:
