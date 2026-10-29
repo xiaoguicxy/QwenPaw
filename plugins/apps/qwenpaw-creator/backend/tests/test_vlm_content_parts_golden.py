@@ -8,11 +8,15 @@ import asyncio
 import base64
 import io
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import pytest
+from agentscope.formatter import AnthropicChatFormatter, OpenAIChatFormatter
+from agentscope.message import Msg
 from PIL import Image
 
 from models import vlm_model
+from models.native_content import native_content_blocks
 from utils.exceptions import ModelError
 
 pytestmark = pytest.mark.unit
@@ -23,6 +27,158 @@ DASHSCOPE = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 def _transport(part, model, base_url):
     coro = vlm_model._transport_local_media_part
     return asyncio.run(coro(part, "vlm-key", model, base_url))
+
+
+def _formatted_media_blocks(parts):
+    """Hand *parts* to the real SDK formatters and keep what they did not drop.
+
+    Returns the non-text block types per formatter, because the interesting
+    failure is silent: an unsupported media type is logged and skipped, so the
+    request simply stops carrying the picture.
+    """
+
+    message = Msg(
+        name="user", role="user", content=native_content_blocks(parts)
+    )
+    outcomes = {}
+    for label, formatter in (
+        ("openai", OpenAIChatFormatter()),
+        ("anthropic", AnthropicChatFormatter()),
+    ):
+        formatted = asyncio.run(formatter.format([message]))
+        outcomes[label] = [
+            block["type"]
+            for block in formatted[0]["content"]
+            if block.get("type") != "text"
+        ]
+    return outcomes
+
+
+def test_meaningless_extension_does_not_outrank_a_confirmed_media_type():
+    """``.bin`` guesses ``application/octet-stream``, which says nothing.
+
+    CPython's built-in mime table maps ``.bin`` to the generic placeholder, so
+    an asset filed under a meaningless suffix used to lose the type its caller
+    had already confirmed. A real suffix still wins: ``.jpg`` knows more than
+    the coarse ``image/png`` family default that ``multimodal_media_part``
+    leaves in place for a part that declares nothing.
+    """
+
+    assert (
+        vlm_model._mime_for_path(Path("image.bin"), "image/png") == "image/png"
+    )
+    assert (
+        vlm_model._mime_for_path(Path("clip.mp4"), "image/png") == "video/mp4"
+    )
+    assert (
+        vlm_model._mime_for_path(Path("photo.jpg"), "image/png")
+        == "image/jpeg"
+    )
+    assert (
+        vlm_model._mime_for_path(Path("no-suffix"), "image/png") == "image/png"
+    )
+    # With nothing confirmed either, the placeholder remains the only answer.
+    assert (
+        vlm_model._mime_for_path(Path("image.bin"), "")
+        == vlm_model._GENERIC_MIME
+    )
+
+
+def test_inlined_media_keeps_its_type_through_the_sdk_formatters(
+    tmp_path,
+    monkeypatch,
+):
+    """The whole path, because the loss happened outside our own assertions.
+
+    A PNG filed as ``image.bin`` used to leave the inline transport as
+    ``data:application/octet-stream``, ``native_content_blocks`` then reads the
+    media type off that header, and both pinned formatters drop a block whose
+    type they do not list: the understanding request went out with text only.
+    """
+
+    source = tmp_path / "image.bin"
+    Image.new("RGB", (8, 8), color="blue").save(source, format="PNG")
+    monkeypatch.setattr(
+        vlm_model.model_config,
+        "get_vlm_max_inline_bytes",
+        lambda: 1024 * 1024,
+    )
+    part = {
+        "type": "image_url",
+        "image_url": {"url": source.as_uri(), "mediaType": "image/png"},
+    }
+
+    transported, uses_temp_oss = _transport(
+        part,
+        "gpt-vision",
+        "https://api.openai.example/v1",
+    )
+    assert uses_temp_oss is False
+    assert str(transported["image_url"]["url"]).startswith(
+        "data:image/png;base64,"
+    )
+
+    text = {"type": "text", "text": "look"}
+    assert _formatted_media_blocks([transported, text]) == {
+        "openai": ["image_url"],
+        "anthropic": ["image"],
+    }
+    # The header the fix protects against, fed to the same formatters.
+    placeholder = dict(
+        transported,
+        image_url={
+            "url": transported["image_url"]["url"].replace(
+                "data:image/png",
+                "data:application/octet-stream",
+            ),
+        },
+    )
+    assert _formatted_media_blocks([placeholder, text]) == {
+        "openai": [],
+        "anthropic": [],
+    }
+
+
+def test_maas_host_uses_the_temporary_upload_like_dashscope(
+    tmp_path,
+    monkeypatch,
+):
+    """A MaaS deployment serves the DashScope API without naming it.
+
+    Classifying it as a generic gateway would push local media onto the inline
+    Base64 budget instead of the 1GB temporary OSS upload, and disagree with
+    how the image backend already routes the same host.
+    """
+
+    maas = "https://token-plan.cn-beijing.maas.aliyuncs.com/api/v1"
+    assert vlm_model._is_dashscope_provider(maas) is True
+
+    image = tmp_path / "reference.png"
+    image.write_bytes(b"png")
+
+    async def fake_upload(path, *, api_key, model_name, media_type):
+        del path, api_key, model_name
+        return f"oss://dashscope-instant/{media_type}"
+
+    monkeypatch.setattr(
+        vlm_model,
+        "upload_local_file_to_dashscope_temp",
+        fake_upload,
+    )
+    part = vlm_model.multimodal_media_part(image.as_uri(), "image")
+    transported, uses_temp_oss = _transport(part, "qwen3-vl", maas)
+    assert uses_temp_oss is True
+    assert (
+        transported["image_url"]["url"] == "oss://dashscope-instant/image/png"
+    )
+
+    # A lookalike must not be handed the DashScope bearer key.
+    assert (
+        vlm_model._is_dashscope_provider(
+            "https://evil.example/.maas.aliyuncs.com",
+        )
+        is False
+    )
 
 
 def test_local_media_transport_dashscope_temp_and_data_url_fallback(
@@ -213,6 +369,83 @@ def test_flatten_alpha_covers_every_mode_that_carries_transparency():
     solid = Image.new("P", (4, 4), color=1)
     solid.putpalette([0, 0, 0, 40, 40, 40] + [0] * (254 * 3))
     assert vlm_model._flatten_alpha(solid).getpixel((0, 0)) == (40, 40, 40)
+
+
+def test_trns_colour_key_takes_the_white_composite_path(tmp_path):
+    """RGB and L PNGs carry transparency as a colour key, not as alpha.
+
+    Saving with ``transparency=(0, 0, 0)`` writes a ``tRNS`` chunk and leaves
+    the mode at RGB, so the mode alone cannot answer "is this transparent?".
+    Measured on Pillow 10.0.1 — the declared floor — and on 13.0.0:
+    ``convert("RGBA")`` applies the key, yielding alpha 0 on the keyed pixels
+    and alpha 255 where the key matches nothing.
+    """
+
+    keyed = tmp_path / "keyed.png"
+    Image.new("RGB", (4, 4), color=(0, 0, 0)).save(
+        keyed,
+        format="PNG",
+        transparency=(0, 0, 0),
+    )
+    with Image.open(keyed) as opened:
+        assert opened.mode == "RGB"
+        assert "transparency" in opened.info
+        assert vlm_model._flatten_alpha(opened).getpixel((0, 0)) == (
+            255,
+            255,
+            255,
+        )
+
+    grey = tmp_path / "grey-key.png"
+    Image.new("L", (4, 4), color=0).save(grey, format="PNG", transparency=0)
+    with Image.open(grey) as opened:
+        assert opened.mode == "L"
+        assert vlm_model._flatten_alpha(opened).getpixel((0, 0)) == (
+            255,
+            255,
+            255,
+        )
+
+    # A key that matches no pixel makes nothing transparent: colour survives.
+    unmatched = tmp_path / "unmatched.png"
+    Image.new("RGB", (4, 4), color=(9, 9, 9)).save(
+        unmatched,
+        format="PNG",
+        transparency=(0, 0, 0),
+    )
+    with Image.open(unmatched) as opened:
+        assert vlm_model._flatten_alpha(opened).getpixel((0, 0)) == (9, 9, 9)
+
+    # A PNG with no key at all still takes the RGB fast path unchanged.
+    plain = Image.new("RGB", (4, 4), color=(0, 0, 0))
+    assert vlm_model._flatten_alpha(plain) is plain
+
+
+def test_reencoded_keyed_png_composites_to_white(tmp_path):
+    """The reported symptom, asserted on pixels rather than on metadata.
+
+    A keyed RGB PNG over the inline budget used to re-encode as solid black,
+    because the fast path never looked for the key, so the VLM saw a filled
+    background where the asset has none. The keyed half is transparent and the
+    pasted half is real content, which is the pair the composite has to get
+    right in both directions.
+    """
+
+    source = tmp_path / "keyed.png"
+    frame = Image.new("RGB", (64, 64), color=(0, 0, 0))
+    frame.paste(Image.new("RGB", (32, 8), color=(20, 20, 20)), (16, 28))
+    frame.save(source, format="PNG", transparency=(0, 0, 0))
+
+    payload = vlm_model._downscale_image_to_budget(source, 64 * 1024)
+
+    assert payload is not None
+    with Image.open(io.BytesIO(payload)) as decoded:
+        assert decoded.format == "JPEG"
+        assert decoded.mode == "RGB"
+        # The keyed corner became the documented white, not stored black.
+        assert min(decoded.getpixel((0, 0))) > 180
+        # Pixels the key does not match kept their own colour.
+        assert max(decoded.getpixel((32, 32))) < 120
 
 
 def test_oversized_non_image_media_still_refused_with_guidance(

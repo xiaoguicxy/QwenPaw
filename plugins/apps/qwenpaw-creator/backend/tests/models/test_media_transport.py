@@ -9,7 +9,10 @@ import io
 import pytest
 from PIL import Image
 
+from models import config as model_config
+from models import image as image_backend
 from models import media_transport
+from models import vlm_model
 from models.media_transport import (
     SEEDANCE_REFERENCE_IMAGE_MAX_BYTES,
     _fetch_dashscope_upload_policy,
@@ -266,3 +269,50 @@ def test_creator_oss_readiness_has_explicit_three_states(
     readiness = media_transport.creator_oss_readiness()
 
     assert readiness["status"] == expected_status
+
+
+MAAS_HOST_CASES = {
+    # A regional MaaS deployment serves the DashScope API under its own host.
+    "https://token-plan.cn-beijing.maas.aliyuncs.com/api/v1": True,
+    "https://maas.aliyuncs.com": True,
+    # The bare host is what config stores for some endpoints.
+    "maas.aliyuncs.com": True,
+    "https://dashscope.aliyuncs.com/compatible-mode/v1": False,
+    # Lookalikes must not select the DashScope transport: doing so would hand
+    # the bearer key to whoever owns the real host of the request.
+    "https://evil.example/.maas.aliyuncs.com": False,
+    "https://maas.aliyuncs.com.evil.com/api/v1": False,
+    "https://user:maas.aliyuncs.com@evil.com/v1": False,
+    "not a url at all": False,
+    "": False,
+}
+
+
+def test_maas_endpoint_predicate_is_one_hostname_decision() -> None:
+    """The MaaS match reads the host, and reads it the same way everywhere.
+
+    It lives in ``model_config`` because the media transport and the image
+    backend both have to agree on which endpoint owns the temporary upload;
+    two private substring matches is how they started disagreeing.
+    """
+
+    for base_url, expected in MAAS_HOST_CASES.items():
+        assert model_config.is_maas_endpoint(base_url) is expected, base_url
+        assert image_backend._is_maas_endpoint(base_url) is expected, base_url
+
+
+def test_dashscope_transport_covers_maas_without_trusting_lookalikes() -> None:
+    """MaaS media travels by the temporary upload; lookalikes do not."""
+
+    dashscope_transport_cases = {
+        "https://dashscope.aliyuncs.com/compatible-mode/v1": True,
+        "https://dashscope-intl.aliyuncs.com/api/v1": True,
+        "https://token-plan.cn-beijing.maas.aliyuncs.com/api/v1": True,
+        "https://api.openai.example/v1": False,
+        "https://evil.example/.maas.aliyuncs.com": False,
+        "https://maas.aliyuncs.com.evil.com/api/v1": False,
+        "": False,
+    }
+    for base_url, expected in dashscope_transport_cases.items():
+        selected = vlm_model._is_dashscope_provider(base_url)
+        assert selected is expected, base_url

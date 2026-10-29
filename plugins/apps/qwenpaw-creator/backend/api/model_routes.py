@@ -18,7 +18,7 @@ import tempfile
 import time
 import wave
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 from urllib.parse import urlparse, urlsplit
 
 import httpx
@@ -1674,6 +1674,7 @@ def _anthropic_llm_probe(
         f"{base}/v1/messages",
         headers,
         {
+            "_attests": _ATTEST_HANDLED,
             "model": body.model_name,
             "messages": [{"role": "user", "content": content}],
         },
@@ -1710,6 +1711,7 @@ def _gemini_llm_probe(
     else:
         parts = [{"text": "Reply with pong only."}]
     payload: dict[str, Any] = {
+        "_attests": _ATTEST_HANDLED,
         "contents": [{"parts": parts}],
     }
     return url, headers, payload
@@ -1812,6 +1814,7 @@ async def _asr_probe(
             f"{base}/audio/transcriptions",
             headers,
             {
+                "_attests": _ATTEST_ASR_WHISPER,
                 "_multipart_probe": {
                     "data": {
                         "model": body.model_name,
@@ -1833,6 +1836,7 @@ async def _asr_probe(
             _qwen3_endpoint(body.base_url),
             {**headers, "X-DashScope-OssResourceResolve": "enable"},
             {
+                "_attests": _ATTEST_ASR_QWEN3,
                 "model": body.model_name,
                 "input": {
                     "messages": [
@@ -1861,6 +1865,7 @@ async def _asr_probe(
             "X-DashScope-OssResourceResolve": "enable",
         },
         {
+            "_attests": _ATTEST_ASR_FUN,
             "model": body.model_name,
             "input": {"file_urls": [file_url]},
             "parameters": {},
@@ -2005,6 +2010,97 @@ def _assert_probe_peer(response: Any) -> None:
     _reject_metadata_address(address)
 
 
+# What a probe's 2xx answer is allowed to prove, declared by the probe that
+# builds it and graded by ``_grade_attestation`` before the route reports a
+# verdict.  Absent means the probe never asked the model to do its work: a
+# GET against a registry, a credit balance, or the read-only voice listing —
+# which posts to a management surface without synthesizing a single sample —
+# all prove the credential and nothing more.  Inferring the level from the
+# verb is what let that listing claim a verified voice.
+_ATTEST_HANDLED = "handled"
+_ATTEST_ASR_WHISPER = "asr-whisper"
+_ATTEST_ASR_QWEN3 = "asr-qwen3"
+_ATTEST_ASR_FUN = "asr-fun"
+
+# The document field each ASR success answer must carry, and whether an empty
+# value still counts.  A silent clip legitimately transcribes to ``""``; an
+# empty ``task_id`` is a submit that produced nothing, and ``asr_model``
+# refuses to poll it.  These mirror what production parses, not what a mock
+# finds convenient.
+_ASR_SUCCESS_FIELDS: dict[str, tuple[tuple[str, ...], bool]] = {
+    _ATTEST_ASR_WHISPER: (("text",), True),
+    _ATTEST_ASR_QWEN3: (("output",), False),
+    _ATTEST_ASR_FUN: (("output", "task_id"), False),
+}
+
+
+def _error_wrapped_in_2xx(document: Mapping[str, Any]) -> str:
+    """Return the provider's own wording when a 2xx body is an error.
+
+    Some gateways answer 200 and put the refusal in the body, which is why a
+    status code alone cannot attest to a capability.
+    """
+    error = document.get("error")
+    if isinstance(error, Mapping):
+        return str(error.get("message") or error.get("type") or error)
+    if error:
+        return str(error)
+    if document.get("code") and document.get("message"):
+        return f"{document['code']}: {document['message']}"
+    return ""
+
+
+def _carries_field(
+    document: Any,
+    path: tuple[str, ...],
+    allow_empty: bool,
+) -> bool:
+    """True when *path* is present in *document*."""
+    node = document
+    for key in path:
+        if not isinstance(node, Mapping) or key not in node:
+            return False
+        node = node[key]
+    return allow_empty or bool(node)
+
+
+def _grade_attestation(
+    attests: str,
+    response: httpx.Response,
+) -> tuple[bool, str]:
+    """Split a 2xx probe into a verification level, or a refusal.
+
+    Returns ``(capability_verified, refusal_reason)``.  A non-empty reason
+    means the answer is positive evidence that the endpoint did not do the
+    work — an HTML interstitial, an empty body, or an error wrapped in a 200 —
+    so the test reports a failure.  A body that is merely unfamiliar leaves
+    ``ok`` true with a credential-only verdict: being unable to prove a
+    capability is not the same as proving a breakage.
+    """
+    if not attests:
+        return False, ""
+    if attests not in _ASR_SUCCESS_FIELDS:
+        return True, ""
+    content_type = (response.headers.get("content-type") or "").casefold()
+    if "text/html" in content_type:
+        return False, "转写探测收到 HTML 页面（可能是登录拦截），不是转写结果"
+    if not (response.text or "").strip():
+        return False, "转写探测收到空响应，无法确认转写路由可用"
+    try:
+        document = json.loads(response.text)
+    except ValueError:
+        return False, ""
+    if not isinstance(document, Mapping):
+        return False, ""
+    wrapped = _error_wrapped_in_2xx(document)
+    if wrapped:
+        return False, f"转写探测在 2xx 响应中返回错误：{wrapped}"
+    path, allow_empty = _ASR_SUCCESS_FIELDS[attests]
+    if _carries_field(document, path, allow_empty):
+        return True, ""
+    return False, ""
+
+
 async def _send_probe(
     client: httpx.AsyncClient,
     url: str,
@@ -2017,7 +2113,9 @@ async def _send_probe(
     selects a multipart/form-data POST (the shape OpenAI-compatible ASR
     transcribes with), and anything else posts JSON. ``Content-Type`` is
     dropped for the first two: a GET carries no body, and httpx has to write
-    the multipart boundary itself.
+    the multipart boundary itself.  ``_attests`` is the probe's own claim
+    about what its 2xx would prove; the caller reads it before sending and it
+    is stripped here so it never reaches the wire.
 
     The destination is validated on the way out and the connected peer on
     the way back, so every probe shape carries the same policy and a new
@@ -2025,6 +2123,7 @@ async def _send_probe(
     """
     _assert_probe_destination(url)
     multipart = payload.pop("_multipart_probe", None)
+    payload.pop("_attests", None)
     if payload.pop("_get_probe", False):
         headers.pop("Content-Type", None)
         response = await client.get(url, headers=headers, params=payload)
@@ -2098,6 +2197,7 @@ def _probe_payload(
             "/api/v1/services/aigc/multimodal-generation/generation",
             headers,
             {
+                "_attests": _ATTEST_HANDLED,
                 "model": body.model_name,
                 "input": {
                     "text": "嗨",
@@ -2117,6 +2217,7 @@ def _probe_payload(
             endpoint,
             headers,
             {
+                "_attests": _ATTEST_HANDLED,
                 "model": body.model_name,
                 "input": {"contents": [{"text": "ping"}]},
                 "parameters": {"dimension": 2560},
@@ -2142,6 +2243,7 @@ def _probe_payload(
             f"{base}/chat/completions",
             headers,
             {
+                "_attests": _ATTEST_HANDLED,
                 "model": body.model_name,
                 "messages": [{"role": "user", "content": content}],
             },
@@ -2279,10 +2381,11 @@ async def test_model_connection(
     start = time.monotonic()
     try:
         url, headers, payload = await _prepare_probe_payload(selected)
-        # Read the marker before sending: _send_probe pops it to choose the
-        # verb, and a GET is precisely the probe that cannot attest to more
-        # than the credential being accepted.
-        capability_verified = "_get_probe" not in payload
+        # Read the claim before sending: ``_send_probe`` strips it, and the
+        # probe declares its own verification level rather than the route
+        # guessing one from the HTTP verb — a read-only management POST is a
+        # POST, and it attests to the credential exactly like a GET does.
+        attests = str(payload.get("_attests") or "")
         # Explicit although already httpx's default: a redirect off the
         # configured endpoint would carry the bearer key with it, and the
         # probe would report a host the operator never named.
@@ -2306,6 +2409,19 @@ async def test_model_connection(
                     ),
                 )
         if response.is_success:
+            capability_verified, refusal = _grade_attestation(
+                attests,
+                response,
+            )
+            if refusal:
+                return ConnectionTestResponse(
+                    ok=False,
+                    ms=elapsed,
+                    error=(
+                        f"{refusal} "
+                        f"[探测端点: {redact_url(url)}，协议: {selected.protocol}]"
+                    ),
+                )
             return ConnectionTestResponse(
                 ok=True,
                 ms=elapsed,
