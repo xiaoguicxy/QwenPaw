@@ -67,8 +67,27 @@ IMAGE_INLINE_LADDER = (
 )
 
 
-def _mime_for_path(path: Path, fallback: str) -> str:
-    return mimetypes.guess_type(path.name)[0] or fallback
+# What ``mimetypes`` answers for a meaningless suffix such as ``.bin``.  It
+# carries no information about the media, so it must not win over a type the
+# caller already confirmed.
+_GENERIC_MIME = "application/octet-stream"
+
+
+def _mime_for_path(path: Path, declared: str) -> str:
+    """Return the media type to label *path* with.
+
+    The extension is consulted only when it knows something: a real ``.jpg``
+    still beats a generic declared family, but ``.bin`` ->
+    ``application/octet-stream`` must not outrank a confirmed ``image/png``,
+    because the data URL header is what survives to the provider —
+    ``native_content._data_block`` reads the media type off the URL, and the
+    AgentScope formatters drop a block whose type they do not recognise.  A
+    wrong subtype costs a re-decode; the placeholder costs the whole image.
+    """
+    guessed = mimetypes.guess_type(path.name)[0]
+    if not guessed or guessed == _GENERIC_MIME:
+        return declared or _GENERIC_MIME
+    return guessed
 
 
 def _local_path_from_url(url: str) -> Path | None:
@@ -105,11 +124,19 @@ def _flatten_alpha(image: Image.Image) -> Image.Image:
     captures and scanned documents are exactly the images that outgrow the
     inline budget, so without this a transparent-background page reaches the
     VLM as pale text on black, the one rendering it reads worst.
+
+    A colour key counts as transparency too: ``tRNS`` is legal on RGB and L
+    PNGs, and PIL applies it inside ``convert("RGBA")`` — measured on Pillow
+    10, the declared floor, and on 13: a black key over black pixels yields
+    alpha 0 and flattens to white, while a key that does not match the pixel
+    keeps alpha 255.  The fast path therefore has to test for the key and not
+    for the mode alone.
     """
-    if image.mode == "RGB":
+    keyed = "transparency" in image.info
+    if image.mode == "RGB" and not keyed:
         return image
     has_alpha = image.mode in {"RGBA", "LA"} or (
-        image.mode == "P" and "transparency" in image.info
+        keyed and image.mode in {"P", "RGB", "L"}
     )
     if not has_alpha:
         return image.convert("RGB")
@@ -277,7 +304,10 @@ def _is_media_related_error(text: str) -> bool:
 
 def _is_dashscope_provider(base_url: str) -> bool:
     host = urlparse(base_url).hostname or ""
-    return "dashscope" in host
+    # A MaaS deployment serves the same API but never spells ``dashscope`` in
+    # its host; classifying it as a generic gateway would drop local media to
+    # the inline Base64 budget instead of the 1GB temporary OSS upload.
+    return "dashscope" in host or model_config.is_maas_endpoint(base_url)
 
 
 def uses_dashscope_transport(base_url: str = "") -> bool:
@@ -346,7 +376,15 @@ async def _transport_local_media_part(
     local_path = _local_path_from_url(url)
     if local_path is None:
         return part, False
-    fallback = "video/mp4" if part_type == "video_url" else "image/png"
+    # Honour a type the part already declares, the way native_content does,
+    # so the inline fallback below is only the family guess for a part that
+    # says nothing at all.
+    declared = str(
+        media_obj.get("mediaType") or media_obj.get("media_type") or "",
+    )
+    fallback = declared or (
+        "video/mp4" if part_type == "video_url" else "image/png"
+    )
     transported = dict(part)
     if _is_dashscope_provider(base_url):
         try:

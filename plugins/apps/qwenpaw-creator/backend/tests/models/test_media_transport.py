@@ -12,7 +12,10 @@ import io
 import pytest
 from PIL import Image
 
+from models import config as model_config
+from models import image as image_backend
 from models import media_transport
+from models import vlm_model
 from models.media_transport import (
     SEEDANCE_REFERENCE_IMAGE_MAX_BYTES,
     _fetch_dashscope_upload_policy,
@@ -567,3 +570,100 @@ def test_reference_upload_key_predicate_mirrors_the_three_routes() -> None:
     assert needs("https://gateway.internal/v1", "AgentScope Platform")
     assert needs("https://dashscope.aliyuncs.com/api/v1")
     assert not needs("https://api.openai.example/v1")
+
+
+MAAS_HOST_CASES = {
+    # A regional MaaS deployment serves the DashScope API under its own host.
+    "https://token-plan.cn-beijing.maas.aliyuncs.com/api/v1": True,
+    "https://maas.aliyuncs.com": True,
+    # The bare host is what config stores for some endpoints.
+    "maas.aliyuncs.com": True,
+    "https://dashscope.aliyuncs.com/compatible-mode/v1": False,
+    # Lookalikes must not select the DashScope transport: doing so would hand
+    # the bearer key to whoever owns the real host of the request.
+    "https://evil.example/.maas.aliyuncs.com": False,
+    "https://maas.aliyuncs.com.evil.com/api/v1": False,
+    "https://user:maas.aliyuncs.com@evil.com/v1": False,
+    "not a url at all": False,
+    "": False,
+}
+
+
+def test_maas_endpoint_predicate_is_one_hostname_decision() -> None:
+    """The MaaS match reads the host, and reads it the same way everywhere.
+
+    It lives in ``model_config`` because the media transport and the image
+    backend both have to agree on which endpoint owns the temporary upload;
+    two private substring matches is how they started disagreeing.
+    """
+
+    for base_url, expected in MAAS_HOST_CASES.items():
+        assert model_config.is_maas_endpoint(base_url) is expected, base_url
+        assert image_backend._is_maas_endpoint(base_url) is expected, base_url
+
+
+def test_dashscope_transport_covers_maas_without_trusting_lookalikes() -> None:
+    """MaaS media travels by the temporary upload; lookalikes do not."""
+
+    dashscope_transport_cases = {
+        "https://dashscope.aliyuncs.com/compatible-mode/v1": True,
+        "https://dashscope-intl.aliyuncs.com/api/v1": True,
+        "https://token-plan.cn-beijing.maas.aliyuncs.com/api/v1": True,
+        "https://api.openai.example/v1": False,
+        "https://evil.example/.maas.aliyuncs.com": False,
+        "https://maas.aliyuncs.com.evil.com/api/v1": False,
+        "": False,
+    }
+    for base_url, expected in dashscope_transport_cases.items():
+        selected = vlm_model._is_dashscope_provider(base_url)
+        assert selected is expected, base_url
+
+
+def test_maas_config_reaches_the_shared_dispatcher_as_a_dashscope_transport(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """A MaaS video reference must not be priced against the VLM budget.
+
+    The dispatcher is the only place the three transports are decided, so this
+    goes through it rather than through a predicate again: the reported
+    regression was a 21 MiB clip that ``uses_dashscope_transport`` filed under
+    "generic gateway", sending it to the inline Base64 refusal instead of the
+    1 GB temporary OSS that same endpoint has always accepted.
+    """
+
+    calls: list[dict] = []
+
+    async def fake_temp_upload(path, **kwargs):
+        del path
+        calls.append(kwargs)
+        return "oss://dashscope-instant/reference.mp4"
+
+    monkeypatch.setattr(
+        media_transport,
+        "upload_local_file_to_dashscope_temp",
+        fake_temp_upload,
+    )
+    maas = "https://workspace.cn-beijing.maas.aliyuncs.com/api/v1"
+    assert media_transport.reference_transport_needs_upload_key(maas) is True
+
+    clip = tmp_path / "reference.mp4"
+    clip.write_bytes(b"\x00")
+    with clip.open("ab") as handle:
+        handle.truncate(21 * 1024 * 1024)
+    assert clip.stat().st_size > 20 * 1024 * 1024
+
+    url = asyncio.run(
+        media_transport.upload_reference_file_for_provider(
+            clip,
+            api_key="sk-test",
+            model_name="wan2.5-i2v",
+            media_type="video/mp4",
+            base_url=maas,
+            protocol="DashScope",
+        ),
+    )
+
+    assert url == "oss://dashscope-instant/reference.mp4"
+    assert calls[0]["media_type"] == "video/mp4"
+    assert calls[0]["model_name"] == "wan2.5-i2v"

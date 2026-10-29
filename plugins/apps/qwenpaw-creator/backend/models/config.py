@@ -757,6 +757,28 @@ def protocol_requires_api_key(protocol: str) -> bool:
     return is_anthropic_protocol(protocol) or is_gemini_protocol(protocol)
 
 
+# MaaS hosts serve the Bailian/DashScope API, including the model-bound
+# temporary upload that local media travels through, so they belong with
+# DashScope rather than with the generic gateways.
+_MAAS_HOST = "maas.aliyuncs.com"
+
+
+def is_maas_endpoint(base_url: str) -> bool:
+    """True when *base_url*'s host is maas.aliyuncs.com or a subdomain.
+
+    Hostname parsing (instead of substring matching) keeps lookalike
+    URLs such as ``https://evil.example/.maas.aliyuncs.com`` from
+    selecting the DashScope transport, which would carry the bearer key
+    to whoever owns that host.
+    """
+    candidate = base_url if "://" in base_url else f"//{base_url}"
+    try:
+        hostname = (urlsplit(candidate).hostname or "").casefold()
+    except ValueError:
+        return False
+    return hostname == _MAAS_HOST or hostname.endswith(f".{_MAAS_HOST}")
+
+
 AGENTSCOPE_PLATFORM_HOST = "agentscope.io"
 
 
@@ -804,8 +826,8 @@ def is_agentscope_protocol(protocol: str) -> bool:
 def is_agentscope_endpoint(base_url: str) -> bool:
     """True when *base_url*'s host is the AgentScope platform or its proxy.
 
-    Hostname parsing rather than substring matching, mirroring
-    ``models.image._is_maas_endpoint``: a lookalike URL path must not select a
+    Hostname parsing rather than substring matching, mirroring the sibling
+    ``is_maas_endpoint`` above: a lookalike URL path must not select a
     different media transport.
     """
     candidate = base_url if "://" in base_url else f"//{base_url}"

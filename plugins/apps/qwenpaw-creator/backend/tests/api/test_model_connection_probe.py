@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import wave
 
 import pytest
@@ -92,6 +93,7 @@ def test_asr_fun_probe_submits_a_real_transcription_task(
     assert headers["X-DashScope-Async"] == "enable"
     assert headers["X-DashScope-OssResourceResolve"] == "enable"
     assert payload == {
+        "_attests": "asr-fun",
         "model": "fun-asr",
         "input": {"file_urls": ["oss://dashscope/creator-probe.wav"]},
         "parameters": {},
@@ -155,6 +157,7 @@ def test_asr_qwen3_probe_uses_the_multimodal_generation_route(
     assert headers["X-DashScope-OssResourceResolve"] == "enable"
     assert "X-DashScope-Async" not in headers
     assert payload == {
+        "_attests": "asr-qwen3",
         "model": "qwen3-asr-flash",
         "input": {
             "messages": [
@@ -242,6 +245,16 @@ def test_asr_protocol_label_cannot_redirect_the_probe(
         # get_asr_provider() only ever returns whisper or fun-asr, so a
         # qwen3-asr model arrives labelled fun-asr and is routed by name.
         ("fun-asr", "", "qwen3-asr-flash", "qwen3-asr"),
+        # The platform names its ASR models a different way, and the
+        # production classifier claims them: a probe that only knew
+        # ``qwen3-asr*`` sent this config to a route the platform does
+        # not deploy at all.
+        (
+            "fun-asr",
+            "AgentScope Platform",
+            "qwen-audio-3.0-asr-flash",
+            "qwen3-asr",
+        ),
         (None, "", "qwen3-asr-flash", "qwen3-asr"),
         ("fun-asr", "DashScope Fun-ASR", "fun-asr", "fun-asr"),
         (None, "", "paraformer-v2", "fun-asr"),
@@ -366,9 +379,10 @@ class _AcceptingResponse:
 
 
 class _ProbeConfig(_EmptyAsrConfig):
-    """The first-run config above, plus the section a read-only probe needs."""
+    """The first-run config above, plus the sections probes read."""
 
     image = _EmptyAsrConfig._Item()
+    tts = _EmptyAsrConfig._Item()
 
 
 def _accepted_connection_test(
@@ -436,6 +450,155 @@ def test_connection_test_marks_a_read_only_probe_as_credential_only(
 
     assert result.ok
     assert result.capability_verified is False
+
+
+class _StubResponse:
+    """A canned 2xx reply carrying the body the route has to grade."""
+
+    is_success = True
+
+    def __init__(self, text: str, content_type: str = "application/json"):
+        self.text = text
+        self.headers = {"content-type": content_type}
+
+    def json(self) -> object:
+        return json.loads(self.text)
+
+
+def _connection_test_replying(
+    request: ModelConnectionTestRequest,
+    monkeypatch: pytest.MonkeyPatch,
+    text: str,
+    content_type: str = "application/json",
+):
+    """Run the endpoint against one specific provider answer.
+
+    The empty-JSON stand-in used everywhere else is exactly what a 200 that
+    proved nothing looks like, so these cases need their own body.
+    """
+
+    async def fake_send(client, url, headers, payload):
+        del client, url, headers, payload
+        return _StubResponse(text, content_type)
+
+    monkeypatch.setattr(model_routes, "load_model_config", _ProbeConfig)
+    monkeypatch.setattr(model_routes, "_send_probe", fake_send)
+    return asyncio.run(model_routes.test_model_connection(request))
+
+
+def test_read_only_voice_listing_stays_credential_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A management POST is a POST, and that used to read as a verdict.
+
+    ``cosyvoice-v3.5-plus`` has no system voices, so the probe lists the
+    enrolled ones instead of synthesizing — an empty list with HTTP 200 says
+    the credential works and nothing about the model producing audio.
+    """
+
+    result = _connection_test_replying(
+        _request(
+            type="tts",
+            model_name="cosyvoice-v3.5-plus",
+            protocol="DashScope CosyVoice",
+            provider=None,
+        ),
+        monkeypatch,
+        '{"output": {"voice_list": []}}',
+    )
+
+    assert result.ok
+    assert result.capability_verified is False
+
+
+def test_a_real_synthesis_probe_still_verifies_the_voice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The guard on the guard: a model with system voices posts audio.
+
+    Demoting the listing must not demote the probe that actually asked the
+    model to speak.
+    """
+
+    result = _connection_test_replying(
+        _request(
+            type="tts",
+            model_name="qwen3-tts-flash",
+            protocol="DashScope TTS",
+            provider=None,
+        ),
+        monkeypatch,
+        '{"output": {"audio": {"url": "https://cdn.example/a.wav"}}}',
+    )
+
+    assert result.ok
+    assert result.capability_verified is True
+
+
+@pytest.mark.parametrize(
+    ("text", "content_type", "expected_ok", "expected_verified"),
+    [
+        # Silence transcribes to an empty string; that is a working route.
+        ('{"text": "", "segments": []}', "application/json", True, True),
+        ('{"text": "hello"}', "application/json", True, True),
+        # An empty 204-style answer is not a transcription document. None
+        # rather than False: the probe failed, so no grade applies.
+        ("", "application/json", False, None),
+        # A login interstitial answers 200 with markup.
+        ("<html>Login required</html>", "text/html", False, None),
+        # Some gateways wrap the refusal inside a 2xx.
+        (
+            '{"error": {"type": "authentication_error", '
+            '"message": "denied"}}',
+            "application/json",
+            False,
+            None,
+        ),
+        # DashScope native errors carry code/message rather than error.
+        (
+            '{"code": "Throttling", "message": "rate limit"}',
+            "application/json",
+            False,
+            None,
+        ),
+        # A streaming answer is not what production parses: unrecognised, so
+        # no capability claim, but no proof of a breakage either.
+        (
+            'event: error\\ndata: {"message": "boom"}\\n\\n',
+            "text/event-stream",
+            True,
+            False,
+        ),
+        # The old success stand-in: valid JSON, no transcription in it.
+        ("{}", "application/json", True, False),
+    ],
+)
+def test_whisper_probe_grades_a_2xx_before_claiming_capability(
+    monkeypatch: pytest.MonkeyPatch,
+    text: str,
+    content_type: str,
+    expected_ok: bool,
+    expected_verified: bool | None,
+) -> None:
+    """HTTP 2xx alone cannot attest that a transcription came back."""
+
+    result = _connection_test_replying(
+        _request(
+            type="asr",
+            base_url="https://api.example.com/v1",
+            model_name="whisper-1",
+            protocol="OpenAI 协议",
+            provider="whisper",
+        ),
+        monkeypatch,
+        text,
+        content_type,
+    )
+
+    assert result.ok is expected_ok
+    assert result.capability_verified is expected_verified
+    if not expected_ok:
+        assert result.error
 
 
 def test_section_validator_reports_a_refused_probe_upload(
@@ -788,7 +951,9 @@ def test_token_plan_probe_uses_models_endpoint(type_, model_name) -> None:
         ("llm", "qwen3.8-flash"),
         ("vlm", "qwen3.8-max"),
         ("image", "qwen-image-3.0"),
-        ("asr", "qwen-audio-3.0-asr-flash"),
+        # ASR is absent on purpose: its probe is built by the async entry,
+        # which uploads the sample and transcribes it.  Asserting a free
+        # listing here measured a route the endpoint never takes.
         ("tts", "qwen-audio-3.0-tts-flash"),
     ],
 )
@@ -796,7 +961,7 @@ def test_agentscope_gateway_probe_lists_models_and_never_completes(
     type_,
     model_name,
 ) -> None:
-    """Every section of the proxy probes for free.
+    """Every read-only section of the proxy probes for free.
 
     The chat route bills even at ``max_tokens=8``, and a Credits-exhausted
     account answers it with a 403 that looks exactly like a permission error -
@@ -1223,3 +1388,71 @@ def test_gemini_vlm_probe_converts_image_to_inline_data() -> None:
     assert len(parts) == 2
     assert parts[0] == {"text": "Reply with red only."}
     assert parts[1]["inline_data"]["mime_type"] == "image/png"
+
+
+def test_platform_asr_probe_stages_its_sample_the_way_production_does(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The test button has to earn the URL it is about to send.
+
+    A platform config cannot mint an ``oss://`` reference: the model proxy has
+    no identity on the Bailian upload-policy API (measured ``401``), so going
+    straight for the DashScope temporary OSS — as this probe did — failed the
+    staging step before the request under test was ever put on the wire, and
+    the route it then named is one the platform does not deploy. Everything
+    here runs through the real endpoint, because the sync helper the earlier
+    platform tests called never reached this code at all.
+    """
+
+    sent: dict[str, object] = {}
+    staged: list[str] = []
+
+    def refuse_dashscope(*_args, **_kwargs):
+        raise AssertionError("a platform config must not mint an oss:// URL")
+
+    async def platform_upload(path, **kwargs):
+        del kwargs
+        staged.append(path.name)
+        return "https://platform-pre.agentscope.io/media/creator-probe.wav"
+
+    async def fake_send(client, url, headers, payload):
+        del client, headers
+        sent["url"] = url
+        sent["payload"] = payload
+        return _StubResponse('{"output": {"choices": []}}')
+
+    monkeypatch.setattr(
+        media_transport,
+        "upload_local_file_to_dashscope_temp",
+        refuse_dashscope,
+    )
+    monkeypatch.setattr(
+        media_transport,
+        "upload_local_file_to_platform_media",
+        platform_upload,
+    )
+    monkeypatch.setattr(model_routes, "load_model_config", _ProbeConfig)
+    monkeypatch.setattr(model_routes, "_send_probe", fake_send)
+
+    result = asyncio.run(
+        model_routes.test_model_connection(
+            _request(
+                type="asr",
+                base_url="https://platform-pre.agentscope.io/v1",
+                api_key="sk-as-test",
+                model_name="qwen-audio-3.0-asr-flash",
+                protocol="AgentScope Platform",
+                provider="fun-asr",
+            ),
+        ),
+    )
+
+    assert staged == ["creator-probe.wav"]
+    assert result.ok is True
+    # The route the production classifier picks for this model name.
+    assert sent["url"] == (
+        "https://platform-pre.agentscope.io/v1/services/aigc/"
+        "multimodal-generation/generation"
+    )
+    assert sent["payload"]["model"] == "qwen-audio-3.0-asr-flash"
+    assert sent["payload"]["_attests"] == "asr-qwen3"
