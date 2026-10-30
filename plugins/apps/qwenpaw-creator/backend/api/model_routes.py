@@ -1950,11 +1950,24 @@ _PROBE_METADATA_ADDRESSES = frozenset(
 
 
 def _reject_metadata_address(address: Any) -> None:
-    """Refuse an address that can only be a cloud metadata service."""
-    if address.is_link_local or address in _PROBE_METADATA_ADDRESSES:
-        raise ProbeDestinationError(
-            "模型 Base URL 不允许指向云元数据服务地址",
-        )
+    """Refuse an address that can only be a cloud metadata service.
+
+    The IPv4-mapped IPv6 spelling names the same host, so it is judged as
+    that address: a policy comparing parsed values would otherwise read
+    ``::ffff:100.100.100.200`` as an ordinary IPv6 and hand the bearer key
+    to the Alibaba metadata endpoint written a second way. The link-local
+    range already came through this notation, which is why only the
+    explicitly listed endpoints were reachable by the alternate spelling.
+    """
+    spellings = [address]
+    mapped = getattr(address, "ipv4_mapped", None)
+    if mapped is not None:
+        spellings.append(mapped)
+    for spelling in spellings:
+        if spelling.is_link_local or spelling in _PROBE_METADATA_ADDRESSES:
+            raise ProbeDestinationError(
+                "模型 Base URL 不允许指向云元数据服务地址",
+            )
 
 
 def _reject_metadata_host(host: str) -> None:

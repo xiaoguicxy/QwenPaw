@@ -808,6 +808,10 @@ class _FakeResponse:
         # would let both through.
         "http://[fd00:ec2::254]/latest/meta-data/",
         "http://100.100.100.200/latest/meta-data/",
+        # The same endpoints written as an IPv4-mapped IPv6 literal, which
+        # a policy comparing parsed values has to see through.
+        "http://[::ffff:169.254.169.254]/latest/meta-data/",
+        "http://[::ffff:100.100.100.200]/latest/meta-data/",
         "http://169.254.1.1:8080/v1/chat/completions",
         "http://[fe80::1]/v1",
     ],
@@ -898,7 +902,12 @@ def test_probe_peer_refuses_a_metadata_socket() -> None:
     service. The peer the socket reached cannot lie about that.
     """
 
-    for peer in ("169.254.169.254", "fd00:ec2::254", "100.100.100.200"):
+    for peer in (
+        "169.254.169.254",
+        "fd00:ec2::254",
+        "100.100.100.200",
+        "::ffff:100.100.100.200",
+    ):
         with pytest.raises(ProbeDestinationError, match="元数据"):
             _assert_probe_peer(_FakeResponse(peer))
 
