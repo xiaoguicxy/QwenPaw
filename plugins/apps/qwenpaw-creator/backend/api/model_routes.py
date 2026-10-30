@@ -52,7 +52,10 @@ from services.runtime_files.errors import (
 from services.runtime_files.idempotency_store import IdempotencyRecordStore
 from services.runtime_files.locking import CrossProcessFileLock
 from services.runtime_files.models import IdempotencyStatus
-from services.storage_root import require_creator_data_root
+from services.storage_root import (
+    CreatorDataRootError,
+    require_creator_data_root,
+)
 
 # QwenPaw secret store for reading encrypted provider API keys
 try:
@@ -1841,43 +1844,75 @@ def _gemini_llm_probe(
     return url, headers, payload
 
 
-def _normalized_origin(base_url: str) -> str:
-    """Return the ``scheme://host:port`` a probe would really connect to.
+def _operator_written_base_url(section: str) -> str:
+    """Return a section's Base URL only when the operator actually wrote one.
 
-    The comparison has to agree with what HTTPX resolves, otherwise the
-    credential guard is decorative: a casefolded hostname lets
-    ``aßistant.example`` impersonate ``assistant.example`` (IDNA makes them
-    different domains), and dropping scheme and port lets a saved key travel to
-    the same host over cleartext HTTP, or to another service on the same box.
-    Path differences stay allowed - DashScope's ``api`` and ``compatible-mode``
-    roots are one endpoint family sharing a key. Returns ``""`` for anything
-    unparseable so a malformed saved value degrades to a refusal, not a 500.
+    ``load_model_config()`` starts from ``_defaults()``, which pre-fills the
+    DashScope address for ASR and Embedding and turns their key-reuse switches
+    on. A non-empty ``base_url`` on a section nobody configured is therefore a
+    product default, not proof that the operator authorised a stored credential
+    for that host. Reading defaults as authorization would let any client of
+    ``/models/test`` make the server send a key saved for another provider to
+    the built-in endpoint, so only values written to ``model_config.json`` or
+    the environment are treated as explicit.
     """
     try:
-        parsed = urlparse(base_url)
-        host = (parsed.hostname or "").rstrip(".")
-        port = parsed.port
-    except (ValueError, UnicodeError):
+        raw = _read_raw_config(_config_paths()).get(section)
+    except (CreatorDataRootError, ValidationError, OSError, TimeoutError):
+        # A config we cannot read proves no authorization: refuse through the
+        # empty-home path rather than inventing a trusted host or turning the
+        # connection test into an unhandled error.
         return ""
-    if not host:
-        return ""
-    try:
-        # HTTPX resolves hosts through the ``idna`` package (UTS-46), and the
-        # stdlib ``idna`` codec is the older IDNA-2003 mapping that folds ß into
-        # "ss" - i.e. the very collision this guard must not walk into.
-        import idna
+    value = (
+        str(raw.get("base_url") or "").strip() if isinstance(raw, dict) else ""
+    )
+    if not value:
+        for name in _ENV_MAPPING.get(section, {}).get("base_url", ()):
+            if os.environ.get(name):
+                value = os.environ[name].strip()
+                break
+    return value
 
-        host = idna.encode(host, uts46=True).decode("ascii")
-    except Exception:  # noqa: BLE001 - IPv6 字面量、缺依赖都会走到这里
-        if not host.isascii():
-            # Without the resolver HTTPX itself uses there is no way to prove
-            # two spellings are one host, and a saved key must not gamble on it.
-            return ""
-        host = host.casefold()
-    scheme = parsed.scheme.casefold()
-    if port is None:
-        port = 443 if scheme == "https" else 80
+
+def _normalized_origin(base_url: str) -> str:
+    """Return the ``scheme://host:port`` HTTPX itself would connect to.
+
+    The guard only has to agree with the client that actually sends the
+    credential, so the origin is taken from HTTPX's own parser rather than a
+    hand-rolled one. That choice is what makes the comparison safe in both
+    directions: HTTPX normalizes case, treats an explicit default port as the
+    scheme default, decodes punycode (``xn--aistant-0va`` and ``aßistant`` are
+    one host), and *rejects* what a looser mapping would fold together - a
+    fullwidth ``ｍ`` maps onto ``example.com`` under UTS-46 while HTTPX raises
+    InvalidURL for it, and casefolding turns ``ß`` into ``ss``.
+
+    Two spellings HTTPX renders to the same host are the same endpoint; a host
+    HTTPX refuses returns ``""``, so the guard answers with a config error
+    instead of letting InvalidURL escape as HTTP 500. Path differences stay
+    allowed - DashScope's ``api`` and ``compatible-mode`` roots share a key.
+    """
+    try:
+        url = httpx.URL(base_url)
+    except (httpx.InvalidURL, ValueError, UnicodeError):
+        return ""
+    scheme = url.scheme.casefold()
+    # No casefold() here: it folds "ß" into "ss", which is the exact collision
+    # this guard exists to catch. HTTPX has already normalized ASCII case.
+    host = url.host
+    if scheme not in {"http", "https"} or not host:
+        return ""
+    port = url.port or (443 if scheme == "https" else 80)
+    if ":" in host:  # IPv6 literal keeps its brackets in the comparison key
+        return f"{scheme}://[{host}]:{port}"
     return f"{scheme}://{host}:{port}"
+
+
+def _origin_scheme_text(base_url: str) -> str:
+    """Best-effort scheme used only to word a refusal, never to decide one."""
+    try:
+        return urlparse(base_url).scheme.casefold()
+    except ValueError:
+        return ""
 
 
 def _probe_target_refusal(
@@ -1887,6 +1922,7 @@ def _probe_target_refusal(
     supplied_key: str,
     stored_key: str,
     trusted_base_urls: Sequence[str],
+    unconfigured_target: bool = False,
 ) -> str:
     """Return a user-facing refusal when the probe target must not be used.
 
@@ -1904,20 +1940,20 @@ def _probe_target_refusal(
       origin the operator explicitly saved it for, and when no such origin is
       recorded the target must not be completed from the request itself.
     """
-    try:
-        scheme = urlparse(probed_base_url).scheme.casefold()
-    except ValueError:
-        scheme = ""
-    if scheme not in {"http", "https"}:
+    target_origin = _normalized_origin(probed_base_url)
+    if not target_origin:
+        scheme = _origin_scheme_text(probed_base_url)
+        if scheme in {"http", "https"}:
+            # The scheme is fine but HTTPX will not build a request for this
+            # host at all (homograph, stray control character, half-written
+            # IPv6 literal). Report the address instead of a protocol hint.
+            return (
+                f"配置不完整：{model_type} 的 Base URL 无法解析"
+                f"（当前: {probed_base_url}）。请在配置弹窗中核对协议、主机与端口。"
+            )
         return (
             f"配置不完整：{model_type} 的 Base URL 必须使用 http 或 https 协议"
             f"（当前: {scheme or '未指定'}）。"
-        )
-    target_origin = _normalized_origin(probed_base_url)
-    if not target_origin:
-        return (
-            f"配置不完整：{model_type} 的 Base URL 无法解析"
-            f"（当前: {probed_base_url}）。请在配置弹窗中核对协议、主机与端口。"
         )
     if supplied_key:
         return ""
@@ -1935,11 +1971,14 @@ def _probe_target_refusal(
             "请先在配置弹窗中保存该地址的 Base URL，或为新地址直接填写 API Key。"
         )
     if target_origin not in homes:
+        default_note = (
+            "本次目标来自内置默认地址，该分项尚未保存 Base URL。" if unconfigured_target else ""
+        )
         return (
             "安全限制：本次探测会使用已保存的 API Key，但目标地址与该 Key 保存时的"
             f"归属地址不一致（已保存: {'、'.join(sorted(homes))}，本次请求: "
-            f"{target_origin}）。"
-            "请先保存模型配置后再测试，或在配置弹窗中重新填写新地址的 API Key。"
+            f"{target_origin}）。{default_note}"
+            "请先保存该分项的 Base URL 后再测试，或在配置弹窗中为新地址填写 API Key。"
         )
     return ""
 
@@ -2188,27 +2227,32 @@ async def test_model_connection(
     loaded = await asyncio.to_thread(load_model_config)
     item = getattr(loaded, body.type)
     fallback_api_key = item.api_key
-    # The addresses this credential is explicitly authorised to reach: the
-    # operator's own saved Base URL for the section, plus the endpoint that
-    # owns a reused key (see _probe_target_refusal).
-    trusted_base_urls = [item.base_url]
+    # The addresses this credential may reach: only Base URLs the operator
+    # actually wrote (model_config.json or env), never the ones _defaults()
+    # pre-fills - see _operator_written_base_url.
+    section_home = _operator_written_base_url(body.type)
+    trusted_base_urls = [section_home]
     if (
         body.type in ("asr", "tts", "s2v", "image", "video")
         and getattr(item, "reuse_llm_key", False)
         and not fallback_api_key
     ):
         fallback_api_key = loaded.llm.api_key
-        # A reused LLM key belongs to the LLM endpoint, and the section's own
-        # saved host was authorised by the saved reuse switch - both are
-        # trusted, while a host the request swaps in is not.
-        trusted_base_urls.append(loaded.llm.base_url)
+        # A reused LLM key belongs to the LLM endpoint, and a section host the
+        # operator saved next to the reuse switch was authorised by that
+        # switch; a default-filled address was not.
+        trusted_base_urls.append(_operator_written_base_url("llm"))
     if (
         body.type == "embedding"
         and getattr(item, "reuse_vlm_key", False)
         and not fallback_api_key
     ):
-        fallback_api_key = loaded.vlm.api_key or loaded.llm.api_key
-        trusted_base_urls.append(loaded.vlm.base_url)
+        # Trust the origin of the key that is really selected: when the VLM
+        # holds no key of its own this falls through to the LLM credential,
+        # and the VLM endpoint does not own that one.
+        key_owner = "vlm" if loaded.vlm.api_key else "llm"
+        fallback_api_key = getattr(loaded, key_owner).api_key
+        trusted_base_urls.append(_operator_written_base_url(key_owner))
     request_api_key = "" if body.api_key == SECRET_MASK else body.api_key
     selected = body.model_copy(
         update={
@@ -2243,6 +2287,9 @@ async def test_model_connection(
         supplied_key=request_api_key,
         stored_key=fallback_api_key,
         trusted_base_urls=trusted_base_urls,
+        unconfigured_target=bool(
+            not section_home and not (body.base_url or "").strip(),
+        ),
     )
     if refusal:
         return ConnectionTestResponse(ok=False, ms=0, error=refusal)
@@ -2341,7 +2388,7 @@ async def test_model_connection(
                 f"连接超时，请检查网络或 Base URL" f"（当前 Base URL: {selected.base_url}）"
             ),
         )
-    except (httpx.HTTPError, ValueError) as exc:
+    except (httpx.InvalidURL, httpx.HTTPError, ValueError) as exc:
         return ConnectionTestResponse(
             ok=False,
             ms=round((time.monotonic() - start) * 1000),
