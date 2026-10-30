@@ -523,11 +523,18 @@ async def _post_with_retry(
     raise RuntimeError("qwen3-asr retry loop exhausted")
 
 
-def _qwen3_endpoint(base_url: str) -> str:
+def _qwen3_endpoint(base_url: str, protocol: str = "") -> str:
     """Multimodal generation endpoint on the same host as the ASR base.
 
     The configured ASR base may carry the fun-asr transcription path
     (token-portal style); qwen3-asr only serves the aigc multimodal path.
+
+    *protocol* names the credential class whose route layout is wanted and
+    falls back to the saved ASR protocol. A caller testing a configuration
+    that has not been saved yet has to pass it: on a custom proxy host the
+    protocol label is the only thing that says which prefix the route lives
+    under, so reading the stale persisted label would probe a path that the
+    configuration being tested never serves.
     """
     parts = urlsplit(base_url)
     scheme = parts.scheme or "https"
@@ -535,7 +542,7 @@ def _qwen3_endpoint(base_url: str) -> str:
     if not host:
         raise ValueError(f"ASR base URL has no host: {base_url!r}")
     if config.is_agentscope_gateway(
-        protocol=config.get_asr_protocol(),
+        protocol=protocol or config.get_asr_protocol(),
         base_url=base_url,
     ):
         # The model proxy serves its API root at /v1 and does not deploy the
