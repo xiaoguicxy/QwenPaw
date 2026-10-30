@@ -33,6 +33,7 @@ from services.file_agent_runtime.model_client import (
     records_to_agentscope_messages,
 )
 from services.file_agent_runtime import model_client
+from services.file_agent_runtime import model_context
 from services.file_agent_runtime.model_context import (
     ModelContextBudgetError,
     _inline_media_relief,
@@ -1227,3 +1228,39 @@ def test_model_retry_recovery_reports_real_cause_and_backoff(
         (reason, attempt, delay) for attempt, delay in enumerate(delays, 1)
     ]
     assert sleeps == [delay for delay in delays if delay]
+
+
+def test_inline_media_relief_does_not_walk_plain_strings(monkeypatch):
+    """A string cannot lead to a data URL, so it must not cost a call.
+
+    The estimate runs over the whole history on every turn, and the walk used
+    to descend into every string it passed — including the megabytes of a
+    serialized script — to return zero each time.
+    """
+
+    original = model_context._inline_media_relief
+    visited: list = []
+
+    def counting(node):
+        visited.append(node)
+        return original(node)
+
+    monkeypatch.setattr(model_context, "_inline_media_relief", counting)
+    history = [
+        {"role": "user", "content": "beat sheet " * 4000},
+        {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "notes " * 4000}],
+        },
+    ]
+
+    assert counting(history) == 0
+    assert [node for node in visited if isinstance(node, str)] == []
+
+    # What the walk is for still works: a data URL under a ``url`` key.
+    encoded = base64.b64encode(b"\x00" * (256 * 1024)).decode()
+    media = {
+        "type": "image_url",
+        "image_url": {"url": f"data:image/jpeg;base64,{encoded}"},
+    }
+    assert original([{"role": "user", "content": [media]}]) > 0

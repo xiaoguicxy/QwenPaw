@@ -1416,11 +1416,13 @@ def test_gemini_vlm_probe_converts_image_to_inline_data() -> None:
         ),
         # A submit that produced no task at all is a refusal, not a mystery.
         ('{"output": {"task_status": "PENDING"}}', False, None, "task_id"),
-        # A gateway that answers with a finished task may be believed.
+        # A gateway that answers with a finished task, but names no subtask.
+        # ``_fun_asr`` reads ``results`` only after a poll, so this proves the
+        # queue took the work and nothing more.
         (
             '{"output": {"task_id": "t-1", "task_status": "SUCCEEDED"}}',
             True,
-            True,
+            False,
             "",
         ),
         # A submit whose ``output`` production cannot index at all: the
@@ -1493,3 +1495,131 @@ def test_asr_probe_refuses_a_metadata_base_without_staging_the_sample(
 
     assert result.ok is False
     assert "元数据" in (result.error or "")
+
+
+@pytest.mark.parametrize(
+    ("body_text", "expected_ok", "expected_verified", "expected_error"),
+    [
+        # The task reports itself finished while its only subtask failed.
+        # ``_fun_asr`` picks the first SUCCEEDED subtask and raises when there
+        # is none, so the next real request would fail on this document.
+        (
+            '{"output": {"task_id": "t-1", "task_status": "SUCCEEDED", '
+            '"results": [{"subtask_status": "FAILED", '
+            '"code": "InvalidParameter", '
+            '"message": "Failed to download audio"}]}}',
+            False,
+            None,
+            "没有成功的子任务",
+        ),
+        # Finished, and the successful subtask carries no transcript to
+        # download: the reader indexes ``transcription_url`` outright.
+        (
+            '{"output": {"task_id": "t-1", "task_status": "SUCCEEDED", '
+            '"results": [{"subtask_status": "SUCCEEDED"}]}}',
+            False,
+            None,
+            "transcription_url",
+        ),
+        # ``results`` as a string iterates into characters whose ``.get`` the
+        # reader would call — the AttributeError one request away.
+        (
+            '{"output": {"task_id": "t-1", "task_status": "SUCCEEDED", '
+            '"results": "SUCCEEDED"}}',
+            False,
+            None,
+            "results",
+        ),
+        # The document a real finished task produces.
+        (
+            '{"output": {"task_id": "t-1", "task_status": "SUCCEEDED", '
+            '"results": [{"subtask_status": "SUCCEEDED", '
+            '"transcription_url": "https://oss.example.test/t.json"}]}}',
+            True,
+            True,
+            "",
+        ),
+        # The silence this probe deliberately asked for is an answer, not a
+        # breakage: ``_fun_asr`` returns an empty transcript for a no-speech
+        # verdict even when the task itself ended FAILED.
+        (
+            '{"output": {"task_id": "t-1", "task_status": "FAILED", '
+            '"code": "ASR_RESPONSE_HAVE_NO_WORDS"}}',
+            True,
+            True,
+            "",
+        ),
+        # The same verdict seen one level down, in the subtask list.
+        (
+            '{"output": {"task_id": "t-1", "task_status": "SUCCEEDED", '
+            '"results": [{"subtask_status": "FAILED", '
+            '"code": "ASR_RESPONSE_HAVE_NO_WORDS"}]}}',
+            True,
+            True,
+            "",
+        ),
+    ],
+)
+def test_fun_asr_terminal_document_is_graded_by_the_poll_reader(
+    monkeypatch: pytest.MonkeyPatch,
+    uploaded_samples: list,
+    body_text: str,
+    expected_ok: bool,
+    expected_verified: bool | None,
+    expected_error: str,
+) -> None:
+    """A terminal ``SUCCEEDED`` is a claim about its subtasks, not a verdict.
+
+    Reproduced from the review: the submit grader stopped at ``task_status``,
+    so a document whose subtasks had failed certified a transcription route
+    that ``asr_model._fun_asr`` refuses with "Fun-ASR failed".
+    """
+
+    del uploaded_samples
+    result = _connection_test_replying(
+        _request(),
+        monkeypatch,
+        body_text,
+    )
+
+    assert result.ok is expected_ok
+    assert result.capability_verified is expected_verified
+    if expected_error:
+        assert expected_error in (result.error or "")
+
+
+def test_send_probe_leaves_the_callers_payload_whole() -> None:
+    """A marker is the sender's to consume, not the caller's to lose.
+
+    Every current caller builds its payload inline and drops it, which is what
+    made the in-place ``pop`` look harmless. It is still a dictionary owned by
+    the caller: a retry, or a log line taken between attempts, would find the
+    markers — and with them the description of what the answer proved — gone.
+    """
+
+    client = _FakeClient()
+    payload = {
+        "_get_probe": True,
+        "_attests": "asr-fun",
+        "action": "getPolicy",
+    }
+
+    asyncio.run(
+        _send_probe(
+            client,
+            "https://example.test/v1",
+            {"Content-Type": "application/json"},
+            payload,
+        ),
+    )
+
+    assert payload == {
+        "_get_probe": True,
+        "_attests": "asr-fun",
+        "action": "getPolicy",
+    }
+    # The markers still keep the request they describe off the wire.
+    verb, _url, headers, params, _json, _files = client.calls[0]
+    assert verb == "GET"
+    assert params == {"action": "getPolicy"}
+    assert "Content-Type" not in headers

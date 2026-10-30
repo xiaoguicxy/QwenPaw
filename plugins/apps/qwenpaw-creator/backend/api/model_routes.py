@@ -2084,16 +2084,73 @@ def _grade_fun_asr_submit(document: Mapping[str, Any]) -> tuple[bool, str]:
         )
     if not output.get("task_id"):
         return False, "转写任务未被受理（异步提交未返回 task_id）"
+    # Imported where production decides, so the probe cannot drift from it.
+    from models.asr_model import _no_speech_output
+
+    no_speech = bool(_no_speech_output(output))
     outcome = str(output.get("task_status") or "").strip().upper()
     if outcome == _ASR_TASK_SUCCEEDED:
-        return True, ""
+        return _grade_fun_asr_terminal(output, no_speech)
     if outcome in _ASR_TASK_FAILED:
+        if no_speech:
+            # ``_fun_asr`` answers an empty transcript for a no-speech verdict
+            # even when the task itself ended FAILED, so the silence this
+            # probe deliberately asked for is not a breakage.
+            return True, ""
         detail = str(output.get("message") or output.get("code") or "")
         return (
             False,
             f"转写任务以 {outcome} 结束" + (f"：{detail}" if detail else ""),
         )
     return False, ""
+
+
+def _grade_fun_asr_terminal(
+    output: Mapping[str, Any],
+    no_speech: bool,
+) -> tuple[bool, str]:
+    """Walk a finished Fun-ASR task the way the poll handler does.
+
+    ``asr_model._fun_asr`` takes the first ``results`` entry whose
+    ``subtask_status`` is SUCCEEDED and indexes its ``transcription_url``, so a
+    document that claims the task finished without such an entry is the
+    ``RuntimeError`` (or ``KeyError``) the next real request would raise, not an
+    unfamiliar answer to be believed. A submit that says nothing at all about
+    the subtasks stays unproven rather than failing: this probe deliberately
+    does not poll, so it must not invent a verdict the poll has not confirmed.
+    """
+    if no_speech:
+        return True, ""
+    results = output.get("results")
+    if results is None:
+        return False, ""
+    if not _walkable_entries(results):
+        return False, (
+            f"转写任务的 results 不是列表（{type(results).__name__}），" "生产遍历子任务会失败"
+        )
+    succeeded = next(
+        (
+            item
+            for item in results
+            if isinstance(item, Mapping)
+            and str(item.get("subtask_status") or "").upper()
+            == _ASR_TASK_SUCCEEDED
+        ),
+        None,
+    )
+    if succeeded is None:
+        failures = "; ".join(
+            str(item.get("message") or item.get("code") or "").strip()
+            for item in results
+            if isinstance(item, Mapping)
+        ).strip("; ")
+        return False, (
+            "转写任务没有成功的子任务，生产会抛 Fun-ASR failed"
+            + (f"：{failures[:160]}" if failures else "")
+        )
+    if not str(succeeded.get("transcription_url") or ""):
+        return False, "转写子任务已成功但未返回 transcription_url，生产下载转写结果时会失败"
+    return True, ""
 
 
 def _error_wrapped_in_2xx(document: Mapping[str, Any]) -> str:
@@ -2311,6 +2368,9 @@ async def _send_probe(
     shape cannot forget it.
     """
     _assert_probe_destination(url)
+    # These markers are this function's to consume: copy first so a caller
+    # that keeps its payload — a retry, a log line — never finds it stripped.
+    payload = dict(payload)
     multipart = payload.pop("_multipart_probe", None)
     payload.pop("_attests", None)
     if payload.pop("_get_probe", False):

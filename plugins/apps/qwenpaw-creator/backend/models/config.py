@@ -1126,6 +1126,29 @@ def get_web_grounding_model_name() -> str:
     )
 
 
+def get_web_grounding_model_protocol() -> str:
+    """Protocol label of the credential the grounding verifier borrows.
+
+    The verifier overrides the key, the base URL and the model, and nothing
+    named the protocol, so a grounding section pointed at the LLM's Token
+    Plan credential was judged by the VLM section's protocol: the crop was
+    routed to the model-bound temporary upload that the borrowed key cannot
+    use (``getPolicy`` answers 401), and the request itself was assembled for
+    a wire format the endpoint may not speak. The upload identity and the
+    wire format both belong to the credential, so this reads the protocol
+    from the same source as the other three fields.
+    """
+    source = get_web_grounding_validation_source()
+    if source == "llm":
+        return get_text_protocol()
+    if source == "vlm":
+        return get_vlm_protocol()
+    return _grounding_explicit(
+        "protocol",
+        ("WEB_GROUNDING_LLM_PROTOCOL", "WEB_GROUNDING_VLM_PROTOCOL"),
+    )
+
+
 def get_web_grounding_native_search_enabled() -> bool:
     return _grounding_bool(
         "native_search_enabled",

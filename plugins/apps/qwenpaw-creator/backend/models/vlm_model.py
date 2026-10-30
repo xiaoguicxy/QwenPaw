@@ -436,12 +436,20 @@ async def _transport_local_media_part(
     api_key: str,
     model_name: str,
     base_url: str,
+    protocol: str = "",
 ) -> tuple[dict, bool]:
     """Replace a local media URL with a provider-transportable URL.
 
     Returns ``(part, uses_temp_oss)``. DashScope-bound requests use the
     official model-bound temporary upload (cached, 48h TTL, <=1GB); other
     OpenAI-compatible providers fall back to an inline Base64 data URL.
+
+    *protocol* names the credential these bytes are uploaded with. Pass it
+    whenever *base_url* comes from a section other than the VLM: the upload
+    identity is a property of the key, so deciding it from the VLM's own
+    protocol sent a borrowed Token Plan credential to the Bailian upload API
+    that refuses it, and only changing the unrelated VLM section could undo
+    that.
     """
     part_type = part.get("type")
     if part_type not in ("image_url", "video_url"):
@@ -457,7 +465,7 @@ async def _transport_local_media_part(
     # through the same rule the direct Anthropic and Gemini inliners use.
     fallback = _media_declaration(media_obj, part_type)
     transported = dict(part)
-    if _is_dashscope_provider(base_url):
+    if _is_dashscope_provider(base_url, protocol):
         try:
             resolved = await upload_local_file_to_dashscope_temp(
                 local_path,
@@ -773,12 +781,19 @@ async def chat_completion(
     api_key_override: str | None = None,
     base_url_override: str | None = None,
     model_name_override: str | None = None,
+    protocol_override: str | None = None,
 ) -> str:
-    """Call the configured VLM and return the assistant text."""
+    """Call the configured VLM and return the assistant text.
+
+    A caller that substitutes another section's credential (the grounding
+    verifier reuses the LLM's Token Plan key) has to name that section's
+    protocol too, because the wire format and the media upload identity both
+    belong to the credential being spent, not to the VLM slot.
+    """
     api_key = api_key_override or model_config.get_vlm_api_key()
     base_url = base_url_override or model_config.get_vlm_base_url()
     model_name = model_name_override or model_config.get_vlm_model_name()
-    protocol = model_config.get_vlm_protocol()
+    protocol = protocol_override or model_config.get_vlm_protocol()
     # Anthropic and Gemini gateways always authenticate; OpenAI-compatible
     # gateways may serve free keyless models (e.g. OpenCode Zen), so an
     # empty key is only an error for protocols that require one.
@@ -859,6 +874,7 @@ async def chat_completion(
                 api_key=api_key,
                 base_url=base_url,
                 model_name=model_name,
+                protocol=protocol,
             )
     except httpx.HTTPStatusError as exc:
         if has_media and _is_media_related_error(exc.response.text):
@@ -962,6 +978,7 @@ async def _call_openai_vlm(
     api_key: str,
     base_url: str,
     model_name: str,
+    protocol: str = "",
 ) -> dict:
     """OpenAI-compatible VLM request (DashScope, DeepSeek, etc.)."""
     provider_content: list[dict] = []
@@ -975,6 +992,7 @@ async def _call_openai_vlm(
             api_key,
             model_name,
             base_url,
+            protocol,
         )
         uses_temp_oss = uses_temp_oss or is_temp_oss
         provider_content.append(normalized)
