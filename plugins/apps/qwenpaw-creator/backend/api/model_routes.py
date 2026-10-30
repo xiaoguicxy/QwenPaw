@@ -1387,7 +1387,9 @@ async def patch_creation_checkpoints(
             first_error = exc.errors()[0] if exc.errors() else {}
             field = ".".join(str(loc) for loc in first_error.get("loc", []))
             message = first_error.get("msg", str(exc))
-            raise ValidationError(f"模型配置校验失败: {field} {message}") from exc
+            raise ValidationError(
+                f"模型配置校验失败: {field} {message}",
+            ) from exc
 
     await asyncio.to_thread(mutate_model_config, mutate)
     return {"ok": True}
@@ -1441,7 +1443,9 @@ async def patch_permission_mode(
             first_error = exc.errors()[0] if exc.errors() else {}
             field = ".".join(str(loc) for loc in first_error.get("loc", []))
             message = first_error.get("msg", str(exc))
-            raise ValidationError(f"模型配置校验失败: {field} {message}") from exc
+            raise ValidationError(
+                f"模型配置校验失败: {field} {message}",
+            ) from exc
 
     await asyncio.to_thread(mutate_model_config, mutate)
     return {"ok": True}
@@ -1464,7 +1468,9 @@ async def patch_media_review(
             first_error = exc.errors()[0] if exc.errors() else {}
             field = ".".join(str(loc) for loc in first_error.get("loc", []))
             message = first_error.get("msg", str(exc))
-            raise ValidationError(f"模型配置校验失败: {field} {message}") from exc
+            raise ValidationError(
+                f"模型配置校验失败: {field} {message}",
+            ) from exc
 
     await asyncio.to_thread(mutate_model_config, mutate)
     return {"ok": True}
@@ -1487,7 +1493,9 @@ async def patch_execution_authorization(
             first_error = exc.errors()[0] if exc.errors() else {}
             field = ".".join(str(loc) for loc in first_error.get("loc", []))
             message = first_error.get("msg", str(exc))
-            raise ValidationError(f"模型配置校验失败: {field} {message}") from exc
+            raise ValidationError(
+                f"模型配置校验失败: {field} {message}",
+            ) from exc
 
     await asyncio.to_thread(mutate_model_config, mutate)
     return {"ok": True}
@@ -1567,7 +1575,9 @@ async def patch_self_review(
             first_error = exc.errors()[0] if exc.errors() else {}
             field = ".".join(str(loc) for loc in first_error.get("loc", []))
             message = first_error.get("msg", str(exc))
-            raise ValidationError(f"模型配置校验失败: {field} {message}") from exc
+            raise ValidationError(
+                f"模型配置校验失败: {field} {message}",
+            ) from exc
 
     await asyncio.to_thread(mutate_model_config, mutate)
     return {"ok": True}
@@ -1611,7 +1621,9 @@ async def patch_model_config_section(
             first_error = exc.errors()[0] if exc.errors() else {}
             field = ".".join(str(loc) for loc in first_error.get("loc", []))
             message = first_error.get("msg", str(exc))
-            raise ValidationError(f"模型配置校验失败: {field} {message}") from exc
+            raise ValidationError(
+                f"模型配置校验失败: {field} {message}",
+            ) from exc
         _ensure_grounding_model_configured(
             resolved,
             previous=current if _config_paths().is_file() else None,
@@ -2192,15 +2204,12 @@ _ATTEST_ASR_WHISPER = "asr-whisper"
 _ATTEST_ASR_QWEN3 = "asr-qwen3"
 _ATTEST_ASR_FUN = "asr-fun"
 
-# The document field each ASR success answer must carry, and whether an empty
-# value still counts.  A silent clip legitimately transcribes to ``""``; an
-# empty ``task_id`` is a submit that produced nothing, and ``asr_model``
-# refuses to poll it.  These mirror what production parses, not what a mock
-# finds convenient.
-_ASR_SUCCESS_FIELDS: dict[str, tuple[tuple[str, ...], bool]] = {
-    _ATTEST_ASR_WHISPER: (("text",), True),
-    _ATTEST_ASR_QWEN3: (("output",), False),
-}
+# A 2xx on an ASR probe is graded by walking the body the way the production
+# reader does, not by whether some field name appears.  ``asr_model`` calls
+# ``response.json()`` and then indexes ``segments``, ``output.choices`` or
+# ``output.task_id``, so a body it cannot walk is not an unfamiliar answer —
+# it is the exception the next real request would raise.  These graders mirror
+# those readers rather than what a mock finds convenient.
 
 # Fun-ASR is the one async route and gets its own grading below: a 2xx submit
 # only says a task was taken, while ``asr_model._fun_asr`` polls until
@@ -2224,7 +2233,14 @@ def _grade_fun_asr_submit(document: Mapping[str, Any]) -> tuple[bool, str]:
     """
     output = document.get("output")
     if not isinstance(output, Mapping):
-        return False, ""
+        # ``_fun_asr`` reads ``output.task_id`` before it polls, so an
+        # ``output`` holding a string — or no ``output`` at all — is the
+        # exception the real request would raise, not an unfamiliar shape.
+        return False, (
+            "转写提交响应的 output 不是对象"
+            + (f"（{type(output).__name__}）" if output is not None else "")
+            + "，生产读取 output.task_id 会失败"
+        )
     if not output.get("task_id"):
         return False, "转写任务未被受理（异步提交未返回 task_id）"
     outcome = str(output.get("task_status") or "").strip().upper()
@@ -2263,18 +2279,135 @@ def _error_wrapped_in_2xx(document: Mapping[str, Any]) -> str:
     return ""
 
 
-def _carries_field(
-    document: Any,
-    path: tuple[str, ...],
-    allow_empty: bool,
-) -> bool:
-    """True when *path* is present in *document*."""
-    node = document
-    for key in path:
-        if not isinstance(node, Mapping) or key not in node:
-            return False
-        node = node[key]
-    return allow_empty or bool(node)
+def _body_sample(body: str) -> str:
+    """Return the leading slice of *body* an operator has to recognise."""
+    return " ".join((body or "").strip()[:120].split())
+
+
+def _non_json_transcript_refusal(body: str, content_type: str) -> str:
+    """Word a 2xx production cannot parse as the failure it is.
+
+    Every ASR reader starts with ``response.json()``, so a streaming frame or
+    a login interstitial is a ``JSONDecodeError`` on the next real request.
+    The content type is quoted rather than trusted: gateways serve HTML under
+    ``text/plain`` often enough that the bytes, not the label, decide what the
+    caller was handed.
+    """
+    sample = _body_sample(body)
+    lowered = sample.casefold()
+    if lowered.startswith("<"):
+        return f"转写探测收到 HTML 页面（可能是登录拦截），不是转写结果：{sample}"
+    if lowered.startswith("event:") or lowered.startswith("data:"):
+        return (
+            f"转写探测收到流式响应（{content_type or '未知类型'}），"
+            f"生产按 JSON 解析该响应会失败：{sample}"
+        )
+    return (
+        f"转写探测的 2xx 响应不是 JSON（{content_type or '未知类型'}），"
+        f"生产按 JSON 解析该响应会失败：{sample}"
+    )
+
+
+def _walkable_entries(value: object) -> bool:
+    """True when production's ``for … in`` / ``[0]`` / ``.get`` walk survives.
+
+    ``json.loads`` only yields dict/list/str/number/bool/None, so a list is the
+    sole shape those readers tolerate: a string iterates into single characters
+    whose ``.get`` raises, and a mapping indexed at ``[0]`` raises ``KeyError``.
+    """
+    return value is None or isinstance(value, (list, tuple))
+
+
+def _grade_whisper_document(document: Mapping[str, Any]) -> tuple[bool, str]:
+    """Grade the answer ``asr_model._whisper`` iterates.
+
+    The reader walks ``segments`` — the field check keyed on ``text`` instead,
+    so a real segment document stayed uncredited — and does ``raw.get`` plus
+    ``float(raw.get("start"))`` on every entry.  A silent clip legitimately
+    yields no segments, which does certify the route; an unreadable
+    ``segments`` is the crash production would hit.
+    """
+    if "segments" in document:
+        segments = document["segments"]
+        if not isinstance(segments, (list, tuple)):
+            return False, (
+                "转写结果的 segments 不是列表" f"（{type(segments).__name__}），生产逐项读取会失败"
+            )
+        for raw in segments:
+            if not isinstance(raw, Mapping):
+                return (
+                    False,
+                    "转写结果的 segments 条目不是对象，生产逐项读取会失败",
+                )
+            for key in ("start", "end"):
+                value = raw.get(key)
+                if value is None:
+                    continue
+                try:
+                    float(value)
+                except (TypeError, ValueError):
+                    return False, ("转写结果的 segments 时间戳不是数值，生产转换会失败")
+        return True, ""
+    if "text" in document:
+        # Without ``verbose_json`` the answer is a bare ``text``; the reader
+        # parses it and walks no segments at all, which is a working route.
+        return True, ""
+    return False, ""
+
+
+def _grade_qwen3_document(document: Mapping[str, Any]) -> tuple[bool, str]:
+    """Grade the answer ``asr_model._qwen3_sentences`` walks.
+
+    The reader opens with ``body["output"].get("choices")``, so an ``output``
+    holding a string — what a gateway writes there when it pastes its own
+    failure into the field — used to certify a capability production would
+    meet with ``AttributeError``.  A readable ``output`` carrying no transcript
+    still proves nothing beyond the credential.
+    """
+    output = document.get("output")
+    if output is not None and not isinstance(output, Mapping):
+        return False, (
+            f"转写结果的 output 不是对象（{type(output).__name__}），"
+            "生产读取 output.choices 会失败"
+        )
+    readable = output if isinstance(output, Mapping) else {}
+    choices = readable.get("choices")
+    if choices:
+        if not _walkable_entries(choices):
+            return False, "转写结果的 choices 不是列表，生产取值会失败"
+        first = choices[0]
+        if not isinstance(first, Mapping):
+            return False, "转写结果的 choices 条目不是对象，生产取值会失败"
+        message = first.get("message")
+        if message is not None and not isinstance(message, Mapping):
+            return False, "转写结果的 message 不是对象，生产取值会失败"
+        content = (message or {}).get("content")
+        if content and not isinstance(
+            content,
+            (list, tuple, Mapping, str),
+        ):
+            return False, "转写结果的 content 无法逐项读取，生产会失败"
+        return True, ""
+    sentence = readable.get("sentence")
+    if isinstance(sentence, Mapping) or (
+        _walkable_entries(sentence) and sentence
+    ):
+        # ``qwen-audio-*-asr-*`` answers through ``output.sentence`` rather
+        # than ``choices``; either shape the reader walks is the working route.
+        return True, ""
+    if "text" in document:
+        return True, ""
+    return False, ""
+
+
+_ASR_DOCUMENT_GRADERS: dict[
+    str,
+    Callable[[Mapping[str, Any]], tuple[bool, str]],
+] = {
+    _ATTEST_ASR_WHISPER: _grade_whisper_document,
+    _ATTEST_ASR_QWEN3: _grade_qwen3_document,
+    _ATTEST_ASR_FUN: _grade_fun_asr_submit,
+}
 
 
 def _grade_attestation(
@@ -2285,35 +2418,35 @@ def _grade_attestation(
 
     Returns ``(capability_verified, refusal_reason)``.  A non-empty reason
     means the answer is positive evidence that the endpoint did not do the
-    work — an HTML interstitial, an empty body, or an error wrapped in a 200 —
-    so the test reports a failure.  A body that is merely unfamiliar leaves
-    ``ok`` true with a credential-only verdict: being unable to prove a
-    capability is not the same as proving a breakage.
+    work — an HTML interstitial, an empty body, a body production cannot
+    parse, or an error wrapped in a 200 — so the test reports a failure.  A
+    body that is merely unfamiliar leaves ``ok`` true with a credential-only
+    verdict: being unable to prove a capability is not the same as proving a
+    breakage.  Each transcription answer is graded by the reader production
+    actually uses, and the asynchronous submit on its task state, because a
+    queued task is by definition not yet a result.
     """
     if not attests:
         return False, ""
-    if attests not in _ASR_SUCCESS_FIELDS and attests != _ATTEST_ASR_FUN:
+    grader = _ASR_DOCUMENT_GRADERS.get(attests)
+    if grader is None:
         return True, ""
-    content_type = (response.headers.get("content-type") or "").casefold()
-    if "text/html" in content_type:
-        return False, "转写探测收到 HTML 页面（可能是登录拦截），不是转写结果"
-    if not (response.text or "").strip():
+    body = response.text or ""
+    if not body.strip():
         return False, "转写探测收到空响应，无法确认转写路由可用"
+    content_type = (response.headers.get("content-type") or "").casefold()
     try:
-        document = json.loads(response.text)
+        document = json.loads(body)
     except ValueError:
-        return False, ""
+        return False, _non_json_transcript_refusal(body, content_type)
     if not isinstance(document, Mapping):
-        return False, ""
+        return False, (
+            "转写探测返回的 JSON 顶层不是对象，生产按字段读取会失败：" f"{_body_sample(body)}"
+        )
     wrapped = _error_wrapped_in_2xx(document)
     if wrapped:
         return False, f"转写探测在 2xx 响应中返回错误：{wrapped}"
-    if attests == _ATTEST_ASR_FUN:
-        return _grade_fun_asr_submit(document)
-    path, allow_empty = _ASR_SUCCESS_FIELDS[attests]
-    if _carries_field(document, path, allow_empty):
-        return True, ""
-    return False, ""
+    return grader(document)
 
 
 async def _send_probe(

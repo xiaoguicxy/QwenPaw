@@ -567,13 +567,41 @@ def test_a_real_synthesis_probe_still_verifies_the_voice(
             False,
             None,
         ),
-        # A streaming answer is not what production parses: unrecognised, so
-        # no capability claim, but no proof of a breakage either.
+        # A streaming answer is exactly what production cannot parse:
+        # ``_whisper`` calls ``response.json()``, so the frame is a crash.
         (
             'event: error\\ndata: {"message": "boom"}\\n\\n',
             "text/event-stream",
-            True,
             False,
+            None,
+        ),
+        # The same interstitial behind a label that claims plain text: the
+        # bytes, not the content type, decide what can be parsed.
+        (
+            "<html><body>Login</body></html>",
+            "text/plain",
+            False,
+            None,
+        ),
+        # Valid JSON whose top level is a list — ``_whisper`` indexes fields
+        # on it, which is an ``AttributeError``.
+        ("[1,2]", "application/json", False, None),
+        # The reader walks ``segments``, so a real segment document counts
+        # even when no top-level ``text`` was promised.
+        (
+            '{"segments": [{"text": "hi", "start": 0.1, "end": 0.9}]}',
+            "application/json",
+            True,
+            True,
+        ),
+        # A segment entry the reader cannot index is the next real request
+        # failing, not an exotic but tolerable answer.
+        ('{"segments": ["hi"]}', "application/json", False, None),
+        (
+            '{"segments": {"0": {"text": "hi"}}}',
+            "application/json",
+            False,
+            None,
         ),
         # The old success stand-in: valid JSON, no transcription in it.
         ("{}", "application/json", True, False),
@@ -599,6 +627,64 @@ def test_whisper_probe_grades_a_2xx_before_claiming_capability(
         monkeypatch,
         text,
         content_type,
+    )
+
+    assert result.ok is expected_ok
+    assert result.capability_verified is expected_verified
+    if not expected_ok:
+        assert result.error
+
+
+@pytest.mark.parametrize(
+    ("text", "expected_ok", "expected_verified"),
+    [
+        # The shape a gateway writes when it pastes its own failure into
+        # ``output``: production's first ``.get`` on it raises, and claiming
+        # a verified transcription from it is the worst answer available.
+        ('{"output": "upstream unavailable"}', False, None),
+        ('{"output": []}', False, None),
+        # The documented answers, both of which ``_qwen3_sentences`` walks.
+        (
+            '{"output": {"choices": [{"message": '
+            '{"content": [{"text": "hi"}]}}]}}',
+            True,
+            True,
+        ),
+        (
+            '{"output": {"sentence": {"text": "hi"}}}',
+            True,
+            True,
+        ),
+        ('{"text": "hi"}', True, True),
+        # Readable but empty: the route answered and nothing was transcribed,
+        # which is the credential-only verdict.
+        ('{"output": {}}', True, False),
+        ("{}", True, False),
+    ],
+)
+def test_qwen3_probe_grades_the_document_production_reads(
+    monkeypatch: pytest.MonkeyPatch,
+    uploaded_samples: list,
+    text: str,
+    expected_ok: bool,
+    expected_verified: bool | None,
+) -> None:
+    """``output`` has to be the object ``_qwen3_sentences`` indexes.
+
+    The field-presence check accepted any truthy value there, so a provider
+    error string certified the transcription route.
+    """
+
+    del uploaded_samples
+    result = _connection_test_replying(
+        _request(
+            base_url="https://dashscope.aliyuncs.com/api/v1",
+            model_name="qwen3-asr-flash",
+            protocol="DashScope Qwen3-ASR",
+            provider=None,
+        ),
+        monkeypatch,
+        text,
     )
 
     assert result.ok is expected_ok
@@ -1503,6 +1589,9 @@ def test_platform_asr_probe_stages_its_sample_the_way_production_does(
             True,
             "",
         ),
+        # A submit whose ``output`` production cannot index at all: the
+        # reader takes ``output.task_id`` before it starts polling.
+        ('{"output": "InternalError"}', False, None, "output"),
         # A state this code does not know is not evidence of a breakage.
         (
             '{"output": {"task_id": "t-1", "task_status": "HELD"}}',

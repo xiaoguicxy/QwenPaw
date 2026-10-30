@@ -72,6 +72,21 @@ IMAGE_INLINE_LADDER = (
 # caller already confirmed.
 _GENERIC_MIME = "application/octet-stream"
 
+
+def _specific_media_type(declared: str) -> str:
+    """Return *declared* unless it is the placeholder that says nothing.
+
+    ``application/octet-stream`` is what an upload form fills in for every
+    byte it cannot name, so honouring it as a confirmed type defeated the
+    family fallback: a suffixless clip left the inline transport labelled
+    ``data:application/octet-stream``, the one header both SDK formatters drop
+    along with the media itself.  A real declared family is kept; the
+    placeholder is read as silence.
+    """
+    value = (declared or "").strip()
+    return "" if value.casefold() == _GENERIC_MIME else value
+
+
 # The image families Creator inlines, keyed by the signature their bytes
 # actually carry.  A label taken from a file name can be wrong in either
 # direction — a converter that writes PNG under a ``.jpg`` suffix, or a real
@@ -121,9 +136,30 @@ def _mime_for_path(path: Path, declared: str) -> str:
     if sniffed:
         return sniffed
     guessed = mimetypes.guess_type(path.name)[0]
+    declared = _specific_media_type(declared)
     if not guessed or guessed == _GENERIC_MIME:
         return declared or _GENERIC_MIME
     return guessed
+
+
+def _media_declaration(media_obj: dict, part_type: str) -> str:
+    """Return the media type a content part carries, or its family.
+
+    Every entry that inlines local media resolves the type through here — the
+    OpenAI-compatible transport and the direct Anthropic and Gemini inliners —
+    because a declaration honoured on one protocol and hardcoded away on
+    another is the same bug wearing a different hat: the outgoing label stops
+    describing the bytes and the formatter that trusts it drops the block.
+    ``application/octet-stream`` is the placeholder an unnamed upload writes for
+    every file, so it counts as saying nothing, and a part that says nothing
+    falls back to its family.
+    """
+    declared = _specific_media_type(
+        str(media_obj.get("mediaType") or media_obj.get("media_type") or ""),
+    )
+    return declared or (
+        "video/mp4" if part_type == "video_url" else "image/png"
+    )
 
 
 def _local_path_from_url(url: str) -> Path | None:
@@ -392,7 +428,8 @@ async def transport_local_media_url(
     because it cannot fetch DashScope's OSS object and answers the DashScope
     upload credential with 401.
     """
-    fallback = media_type or (
+    declared = _specific_media_type(media_type)
+    fallback = declared or (
         "video/mp4"
         if local_path.suffix.lower() in VIDEO_SUFFIXES
         else "image/png"
@@ -402,7 +439,7 @@ async def transport_local_media_url(
             local_path,
             api_key=api_key,
             model_name=model_name,
-            media_type=media_type or _mime_for_path(local_path, fallback),
+            media_type=declared or _mime_for_path(local_path, fallback),
         )
     return await asyncio.to_thread(_data_url, local_path, fallback)
 
@@ -430,14 +467,8 @@ async def _transport_local_media_part(
     if local_path is None:
         return part, False
     # Honour a type the part already declares, the way native_content does,
-    # so the inline fallback below is only the family guess for a part that
-    # says nothing at all.
-    declared = str(
-        media_obj.get("mediaType") or media_obj.get("media_type") or "",
-    )
-    fallback = declared or (
-        "video/mp4" if part_type == "video_url" else "image/png"
-    )
+    # through the same rule the direct Anthropic and Gemini inliners use.
+    fallback = _media_declaration(media_obj, part_type)
     transported = dict(part)
     if _is_dashscope_provider(base_url):
         try:
@@ -1040,7 +1071,7 @@ async def _call_anthropic_vlm(
             url = str(media_obj.get("url") or "")
             local_path = _local_path_from_url(url)
             if local_path is not None:
-                fallback = "image/png"
+                fallback = _media_declaration(media_obj, part_type)
                 mime, b64_data = await asyncio.to_thread(
                     _inline_base64,
                     local_path,
@@ -1108,7 +1139,7 @@ async def _call_gemini_vlm(
         if part_type in ("image_url", "video_url"):
             media_obj = normalized.get(part_type) or {}
             url = str(media_obj.get("url") or "")
-            fallback = "video/mp4" if part_type == "video_url" else "image/png"
+            fallback = _media_declaration(media_obj, part_type)
             local_path = _local_path_from_url(url)
             if local_path is not None:
                 mime, b64_data = await asyncio.to_thread(
