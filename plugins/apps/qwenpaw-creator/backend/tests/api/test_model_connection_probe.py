@@ -497,6 +497,7 @@ def _stub_saved_config(monkeypatch, **sections: dict) -> None:
         "voice": "",
         "reuse_llm_key": False,
         "reuse_vlm_key": False,
+        "use_llm": False,
     }
     saved = {
         name: types.SimpleNamespace(
@@ -814,6 +815,13 @@ def test_environment_key_without_a_saved_home_is_refused(
             "qwen3-vl-embedding",
             "DashScope Multimodal",
         ),
+        (
+            "embedding",
+            "llm",
+            "sk-llm",
+            "qwen3-vl-embedding",
+            "DashScope Multimodal",
+        ),
     ],
 )
 def test_saved_cross_host_key_reuse_still_probes_its_own_host(
@@ -829,6 +837,8 @@ def test_saved_cross_host_key_reuse_still_probes_its_own_host(
     The route previously re-anchored a reused key to the owner endpoint only,
     which refused a config that was already saved and never edited by this
     request - and the hint to "save it first" could not help, because it was.
+    The third case has no VLM credential at all, so the reuse switch reaches
+    past the VLM to the LLM key and must follow the LLM endpoint instead.
     """
     from api import model_routes
 
@@ -905,6 +915,10 @@ def test_get_probe_params_never_carry_the_credential() -> None:
     assert _non_secret_probe_params({"model": "fun-asr"}, "") == {
         "model": "fun-asr",
     }
+    # A wrapped credential is still the credential.
+    assert (
+        _non_secret_probe_params({"a": "Bearer sk-secret"}, "sk-secret") == {}
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1190,4 +1204,166 @@ def test_an_unconfigured_llm_address_is_not_an_authorization_either(
 
     assert not response.ok
     assert "归属地址" in response.error
+    assert not sent
+
+
+def test_a_vlm_reusing_the_llm_config_probes_the_llm_origin(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """The inherited LLM key keeps its own home, so this probe must pass.
+
+    ``use_llm`` copies the LLM credential into the VLM section without its
+    provenance, and the operator never wrote a Base URL there.  Reading that
+    as "no recorded home" refused the one endpoint the saved key belongs to,
+    and told the operator to save an address that was already saved.
+    """
+    from api import model_routes
+
+    _write_real_config(
+        monkeypatch,
+        tmp_path,
+        {**_saved_llm_only(), "vlm": {"use_llm": True}},
+    )
+    sent = _real_transport_dispatch(monkeypatch)
+
+    response = asyncio.run(
+        model_routes.test_model_connection(
+            ModelConnectionTestRequest(type="vlm"),
+        ),
+    )
+
+    assert response.ok, response.error
+    assert sent and sent[0][0].startswith("https://llm.example")
+    assert sent[0][1] == "Bearer sk-review-owner-fake"
+
+
+def test_a_stale_vlm_address_does_not_authorise_the_borrowed_key(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """``use_llm`` overwrites the VLM address, so it proves nothing either.
+
+    A section that borrows the LLM credential can still hold the address saved
+    before the switch was flipped. Assembly replaces it and the product never
+    sends there, so the guard must not keep it as an extra host the LLM key is
+    allowed to reach.
+    """
+    from api import model_routes
+
+    _write_real_config(
+        monkeypatch,
+        tmp_path,
+        {
+            **_saved_llm_only(),
+            "vlm": {
+                "use_llm": True,
+                "base_url": "https://stale-vlm.example/v1",
+                "api_key": "",
+            },
+        },
+    )
+    sent = _real_transport_dispatch(monkeypatch)
+
+    response = asyncio.run(
+        model_routes.test_model_connection(
+            ModelConnectionTestRequest(
+                type="vlm",
+                base_url="https://stale-vlm.example/v1",
+                model_name="glm-5",
+                protocol="OpenAI Chat",
+            ),
+        ),
+    )
+
+    assert not response.ok
+    assert "安全限制" in response.error
+    assert not sent
+
+
+def test_embedding_may_probe_the_origin_that_owns_the_inherited_key(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """A transitively borrowed credential is still the LLM's credential.
+
+    Embedding reuses the VLM key while the VLM reuses the LLM config, so the
+    key in play was saved for the LLM address.  Naming the VLM as its owner
+    left the LLM origin outside the trust set and refused it.
+    """
+    from api import model_routes
+
+    _write_real_config(
+        monkeypatch,
+        tmp_path,
+        {
+            **_saved_llm_only(),
+            "vlm": {"use_llm": True},
+            "embedding": {
+                "base_url": "https://embedding.example/v1",
+                "api_key": "",
+                "reuse_vlm_key": True,
+                "model_name": "qwen3-vl-embedding",
+            },
+        },
+    )
+    sent = _real_transport_dispatch(monkeypatch)
+
+    response = asyncio.run(
+        model_routes.test_model_connection(
+            ModelConnectionTestRequest(
+                type="embedding",
+                base_url="https://llm.example/v1",
+                model_name="qwen3-vl-embedding",
+            ),
+        ),
+    )
+
+    assert response.ok, response.error
+    assert sent and sent[0][0].startswith("https://llm.example")
+    assert sent[0][1] == "Bearer sk-review-owner-fake"
+
+
+def test_embedding_names_the_llm_as_the_owner_of_an_inherited_key(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """A refusal has to show the hosts the key really was saved for.
+
+    The hint is the only thing an operator reads; listing just the embedding
+    address while the LLM credential is the one at risk sends them to fix the
+    wrong section.
+    """
+    from api import model_routes
+
+    _write_real_config(
+        monkeypatch,
+        tmp_path,
+        {
+            **_saved_llm_only(),
+            "vlm": {"use_llm": True},
+            "embedding": {
+                "base_url": "https://embedding.example/v1",
+                "api_key": "",
+                "reuse_vlm_key": True,
+                "model_name": "qwen3-vl-embedding",
+            },
+        },
+    )
+    sent = _real_transport_dispatch(monkeypatch)
+
+    response = asyncio.run(
+        model_routes.test_model_connection(
+            ModelConnectionTestRequest(
+                type="embedding",
+                base_url="https://intruder.example/v1",
+                model_name="qwen3-vl-embedding",
+            ),
+        ),
+    )
+
+    assert not response.ok
+    assert "安全限制" in response.error
+    assert "https://llm.example:443" in response.error
+    assert "https://embedding.example:443" in response.error
     assert not sent
