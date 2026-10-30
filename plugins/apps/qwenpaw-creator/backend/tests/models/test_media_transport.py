@@ -8,6 +8,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
+import socket
+from urllib.parse import urlparse
 
 import pytest
 from PIL import Image
@@ -713,3 +715,311 @@ def test_token_plan_media_stays_on_the_inline_budget(tmp_path, monkeypatch):
     )
 
     assert str(url).startswith("data:image/png;base64,")
+
+
+class _PinnedUploadClient:
+    """Records the exact request a guarded upload puts on the wire."""
+
+    def __init__(self, observed, peer=None, status=200, text=""):
+        self.observed = observed
+        self.peer = peer
+        self.status = status
+        self.text = text
+
+    def __call__(self, **kwargs):
+        self.observed["client_kwargs"] = kwargs
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+    def post(self, url, **kwargs):
+        self.observed["url"] = url
+        self.observed["kwargs"] = kwargs
+        response = _FakeResponse(
+            {"items": [{"url": "https://cdn.example.test/a.wav"}]},
+        )
+        response.status_code = self.status
+        response.text = self.text
+        if self.peer is not None:
+            response.extensions = {
+                "network_stream": _GuardedUploadStream(self.peer),
+            }
+        return response
+
+
+class _GuardedUploadStream:
+    """Names the peer the socket actually ended up talking to."""
+
+    def __init__(self, peer):
+        self.peer = peer
+
+    def get_extra_info(self, key):
+        return (self.peer, 443) if key == "server_addr" else None
+
+
+_METADATA_ADDRESSES = {"169.254.169.254", "fe80::ec2:254"}
+
+
+def _recording_guard():
+    """Stand in for the route's policy, judging what it is handed."""
+    seen: list = []
+
+    def guard(url):
+        seen.append(url)
+        host = urlparse(url).hostname or ""
+        if host in _METADATA_ADDRESSES:
+            raise ValueError(f"forbidden address: {host}")
+
+    return guard, seen
+
+
+def _stub_resolver(monkeypatch, answers, *, explode=False):
+    looked_up: list = []
+
+    def fake_getaddrinfo(host, port, **kwargs):
+        del kwargs
+        looked_up.append(host)
+        if explode:
+            raise AssertionError("an unguarded upload must not resolve")
+        return [(2, 1, 6, "", (address, port)) for address in answers]
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+    return looked_up
+
+
+def _addressed(upload_url, address):
+    """The URL form the pin sends: the literal address as authority."""
+    host = f"[{address}]" if ":" in address else address
+    return upload_url.replace("gateway.example.test", f"{host}:443", 1)
+
+
+@pytest.mark.parametrize(
+    "address",
+    ["169.254.169.254", "fe80::ec2:254"],
+)
+def test_guarded_upload_refuses_a_name_that_resolves_to_metadata(
+    monkeypatch,
+    address,
+) -> None:
+    """The policy judges a hostname as a hostname; the socket judges an address.
+
+    Reproduced from the review: the strict upload checked only the URL string,
+    so a configured host resolving to the cloud-metadata address still got the
+    bearer token and the audio, and the connected peer was never read.
+    """
+    observed: dict = {}
+    guard, seen = _recording_guard()
+    monkeypatch.setattr(
+        media_transport.httpx,
+        "Client",
+        _PinnedUploadClient(observed),
+    )
+    _stub_resolver(monkeypatch, [address])
+
+    with pytest.raises(ValueError, match="forbidden address"):
+        media_transport._upload_bytes_to_platform_media_sync(
+            b"RIFF" + bytes(44),
+            "probe.wav",
+            api_key="sk-platform",
+            base_url="https://gateway.example.test/v1",
+            media_type="audio/wav",
+            destination_guard=guard,
+        )
+
+    # Nothing reached the wire, and the resolution was checked as an address.
+    assert "url" not in observed
+    assert seen[0] == "https://gateway.example.test/v1/media/uploads"
+    assert seen[-1] == _addressed(
+        "https://gateway.example.test/v1/media/uploads",
+        address,
+    )
+
+
+def test_guarded_upload_judges_every_answer_the_resolver_returns(
+    monkeypatch,
+) -> None:
+    """A safe first address does not excuse a hostile second one.
+
+    The pin picks one, but the policy has to see all of them: otherwise a name
+    whose records mix a public address with the metadata one would be bound to
+    whichever the resolver happened to list first.
+    """
+    observed: dict = {}
+    guard, seen = _recording_guard()
+    monkeypatch.setattr(
+        media_transport.httpx,
+        "Client",
+        _PinnedUploadClient(observed),
+    )
+    _stub_resolver(monkeypatch, ["93.184.216.34", "169.254.169.254"])
+
+    with pytest.raises(ValueError, match="forbidden address"):
+        media_transport._upload_bytes_to_platform_media_sync(
+            b"RIFF" + bytes(44),
+            "probe.wav",
+            api_key="sk-platform",
+            base_url="https://gateway.example.test/v1",
+            media_type="audio/wav",
+            destination_guard=guard,
+        )
+
+    assert "url" not in observed
+    assert len(seen) == 3
+
+
+def test_guarded_upload_sends_to_the_validated_literal_under_the_configured_host(
+    monkeypatch,
+) -> None:
+    """Binding the address may not change what the provider is told.
+
+    The request goes to the literal the policy accepted, while the ``Host``
+    header and the TLS server name stay the endpoint the user configured — a
+    pinned request that looked like a request to an IP address would break the
+    very proxy it is meant to reach.
+    """
+    observed: dict = {}
+    guard, seen = _recording_guard()
+    monkeypatch.setattr(
+        media_transport.httpx,
+        "Client",
+        _PinnedUploadClient(observed, peer="93.184.216.34"),
+    )
+    _stub_resolver(monkeypatch, ["93.184.216.34"])
+
+    url = media_transport._upload_bytes_to_platform_media_sync(
+        b"RIFF" + bytes(44),
+        "probe.wav",
+        api_key="sk-platform",
+        base_url="https://gateway.example.test/v1",
+        media_type="audio/wav",
+        destination_guard=guard,
+    )
+
+    assert url == "https://cdn.example.test/a.wav"
+    assert observed["url"] == "https://93.184.216.34:443/v1/media/uploads"
+    headers = observed["kwargs"]["headers"]
+    assert headers["Host"] == "gateway.example.test"
+    assert headers["Authorization"] == "Bearer sk-platform"
+    assert observed["kwargs"]["extensions"] == {
+        "sni_hostname": "gateway.example.test",
+    }
+    # The peer was read and judged by the same policy as the answers.
+    assert seen[-1] == "https://93.184.216.34:443/v1/media/uploads"
+
+
+def test_guarded_upload_wraps_an_ipv6_answer_in_brackets(monkeypatch) -> None:
+    observed: dict = {}
+    guard, _seen = _recording_guard()
+    monkeypatch.setattr(
+        media_transport.httpx,
+        "Client",
+        _PinnedUploadClient(observed, peer="2001:db8::1"),
+    )
+    _stub_resolver(monkeypatch, ["2001:db8::1"])
+
+    media_transport._upload_bytes_to_platform_media_sync(
+        b"RIFF" + bytes(44),
+        "probe.wav",
+        api_key="sk-platform",
+        base_url="https://gateway.example.test/v1",
+        media_type="audio/wav",
+        destination_guard=guard,
+    )
+
+    assert observed["url"] == "https://[2001:db8::1]:443/v1/media/uploads"
+
+
+def test_guarded_upload_refuses_a_peer_that_was_never_an_answer(
+    monkeypatch,
+) -> None:
+    """A transport that ignored the pin, or a proxy in between, still gets caught."""
+    observed: dict = {}
+    guard, _seen = _recording_guard()
+    monkeypatch.setattr(
+        media_transport.httpx,
+        "Client",
+        _PinnedUploadClient(observed, peer="203.0.113.7"),
+    )
+    _stub_resolver(monkeypatch, ["93.184.216.34"])
+
+    with pytest.raises(RuntimeError, match="was not resolved to"):
+        media_transport._upload_bytes_to_platform_media_sync(
+            b"RIFF" + bytes(44),
+            "probe.wav",
+            api_key="sk-platform",
+            base_url="https://gateway.example.test/v1",
+            media_type="audio/wav",
+            destination_guard=guard,
+        )
+
+    assert "url" in observed  # the peer is read from the reply it answered
+
+
+def test_guarded_upload_failure_names_the_configured_host(monkeypatch) -> None:
+    """An operator reads their own endpoint in the message, not one address."""
+    observed: dict = {}
+    guard, _seen = _recording_guard()
+    monkeypatch.setattr(
+        media_transport.httpx,
+        "Client",
+        _PinnedUploadClient(
+            observed,
+            peer="93.184.216.34",
+            status=500,
+            text="backend exploded",
+        ),
+    )
+    _stub_resolver(monkeypatch, ["93.184.216.34"])
+
+    with pytest.raises(RuntimeError) as excinfo:
+        media_transport._upload_bytes_to_platform_media_sync(
+            b"RIFF" + bytes(44),
+            "probe.wav",
+            api_key="sk-platform",
+            base_url="https://gateway.example.test/v1",
+            media_type="audio/wav",
+            destination_guard=guard,
+        )
+
+    assert "https://gateway.example.test/v1/media/uploads" in str(
+        excinfo.value,
+    )
+    assert "93.184.216.34" not in str(excinfo.value)
+
+
+def test_unguarded_production_upload_still_resolves_on_its_own(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """Nothing about the shared production path may change.
+
+    The binding exists for the probe's policy. Ordinary uploads keep their
+    own resolution, their cache and the URL the provider expects to see.
+    """
+    sample = tmp_path / "reference.wav"
+    sample.write_bytes(b"RIFF" + bytes(44))
+    observed: dict = {}
+    monkeypatch.setattr(
+        media_transport.httpx,
+        "Client",
+        _PinnedUploadClient(observed),
+    )
+    looked_up = _stub_resolver(monkeypatch, ["93.184.216.34"], explode=True)
+
+    url = media_transport._upload_file_to_platform_media_sync(
+        sample,
+        api_key="sk-platform",
+        base_url="https://gateway.example.test/v1",
+        media_type="audio/wav",
+    )
+
+    assert not looked_up
+    assert url == "https://cdn.example.test/a.wav"
+    assert observed["url"] == "https://gateway.example.test/v1/media/uploads"
+    assert "Host" not in observed["kwargs"]["headers"]
+    # One client per upload, with redirects left on for the proxy's own path.
+    assert observed["client_kwargs"]["follow_redirects"] is True

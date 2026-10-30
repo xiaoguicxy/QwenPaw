@@ -49,6 +49,10 @@ def _inline_media_relief(node: Any) -> int:
     Subtracted from ``json_bytes`` so both measurements agree on what one
     image or clip actually costs the provider.
     """
+    if node is None or isinstance(node, str):
+        # Neither can carry relief, and this runs over the whole history of
+        # every context estimate.
+        return 0
     if isinstance(node, dict):
         relief = 0
         for key, value in node.items():
@@ -67,7 +71,10 @@ def _inline_media_relief(node: Any) -> int:
                     else len(value.encode("utf-8"))
                 )
                 relief += max(0, raw - _data_url_charge(value))
-            else:
+            elif isinstance(value, (dict, list)):
+                # Only a mapping or a sequence can lead to a ``url`` key, so a
+                # plain string of the history is not worth a call: a context
+                # estimate walks the whole conversation on every turn.
                 relief += _inline_media_relief(value)
         return relief
     if isinstance(node, list):
