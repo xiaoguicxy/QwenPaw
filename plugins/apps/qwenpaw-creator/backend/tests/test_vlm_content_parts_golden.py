@@ -56,6 +56,157 @@ def _formatted_media_blocks(parts):
     return outcomes
 
 
+def test_media_declaration_separates_three_levels_of_confidence():
+    """A specific type, a placeholder, and a family are not the same claim.
+
+    All three arrived at one ``mediaType`` field, and treating them alike is
+    what let a placeholder outrank the family fallback: only the first is a
+    declaration, the second says nothing about the bytes, and the third is the
+    coarse guess every unnamed part is filed under.
+    """
+
+    assert (
+        vlm_model._media_declaration(
+            {"mediaType": "video/quicktime"},
+            "video_url",
+        )
+        == "video/quicktime"
+    )
+    assert (
+        vlm_model._media_declaration(
+            {"mediaType": "application/octet-stream"},
+            "video_url",
+        )
+        == "video/mp4"
+    )
+    assert vlm_model._media_declaration({}, "image_url") == "image/png"
+    assert (
+        vlm_model._media_declaration({"mediaType": "IMAGE/PNG"}, "image_url")
+        == "IMAGE/PNG"
+    )
+
+
+def test_direct_protocol_entries_inherit_the_part_declaration(
+    tmp_path,
+    monkeypatch,
+):
+    """The Anthropic and Gemini inliners used to hardcode a family.
+
+    Both sit behind the same OpenAI-shaped parts as the compatible transport,
+    yet ignored ``mediaType`` entirely: a TIFF filed as ``frame.bin`` and a
+    QuickTime clip filed as ``clip.bin`` went out as ``image/png`` and
+    ``video/mp4``, labelling bytes their provider never described.
+    """
+
+    monkeypatch.setattr(
+        vlm_model.model_config,
+        "get_vlm_max_inline_bytes",
+        lambda: 1024 * 1024,
+    )
+
+    captured: dict = {}
+
+    class FakeResponse:
+        status_code = 200
+        headers: dict = {}
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {
+                "content": [{"type": "text", "text": "ok"}],
+                "max_tokens": 4096,
+                "candidates": [
+                    {
+                        "content": {"parts": [{"text": "ok"}]},
+                        "finishReason": "STOP",
+                    },
+                ],
+            }
+
+    class FakeAsyncClient:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+        async def post(self, url, *, headers, json):
+            del url, headers
+            captured["body"] = json
+            return FakeResponse()
+
+        async def get(self, url, *, headers):
+            # ``anthropic_output_limit`` resolves an unknown model through the
+            # read-only Models API before it builds the request.
+            del url, headers
+            return FakeResponse()
+
+    @asynccontextmanager
+    async def fake_model_slot(_kind):
+        yield
+
+    monkeypatch.setattr(vlm_model.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(vlm_model, "model_slot", fake_model_slot)
+
+    still = tmp_path / "frame.bin"
+    still.write_bytes(b"\x00" * 64)
+    clip = tmp_path / "clip.bin"
+    clip.write_bytes(b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 64)
+
+    asyncio.run(
+        vlm_model._call_anthropic_vlm(
+            [
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": still.as_uri(),
+                        "mediaType": "image/tiff",
+                    },
+                },
+            ],
+            system_prompt="",
+            temperature=0.2,
+            timeout=5.0,
+            api_key="an-test-key",
+            base_url="https://api.anthropic.com",
+            model_name="claude-sonnet-4-20250514",
+        ),
+    )
+    assert (
+        captured["body"]["messages"][0]["content"][0]["source"]["media_type"]
+        == "image/tiff"
+    )
+
+    asyncio.run(
+        vlm_model._call_gemini_vlm(
+            [
+                {
+                    "type": "video_url",
+                    "video_url": {
+                        "url": clip.as_uri(),
+                        "mediaType": "video/quicktime",
+                    },
+                },
+            ],
+            system_prompt="",
+            temperature=0.2,
+            timeout=5.0,
+            api_key="gm-test-key",
+            base_url="https://generativelanguage.googleapis.com",
+            model_name="gemini-2.5-pro",
+        ),
+    )
+    assert (
+        captured["body"]["contents"][0]["parts"][0]["inline_data"]["mime_type"]
+        == "video/quicktime"
+    )
+
+
 def test_meaningless_extension_does_not_outrank_a_confirmed_media_type():
     """``.bin`` guesses ``application/octet-stream``, which says nothing.
 
@@ -83,6 +234,63 @@ def test_meaningless_extension_does_not_outrank_a_confirmed_media_type():
     assert (
         vlm_model._mime_for_path(Path("image.bin"), "")
         == vlm_model._GENERIC_MIME
+    )
+
+
+def test_a_placeholder_media_type_does_not_defeat_the_family_fallback(
+    tmp_path,
+    monkeypatch,
+):
+    """``application/octet-stream`` is what an unnamed upload form submits.
+
+    Treating it as a confirmed type left a suffixless clip inlined as
+    ``data:application/octet-stream`` — the header both SDK formatters drop —
+    while the same part declaring nothing at all correctly fell back to
+    ``video/mp4``.  A placeholder cannot outrank a family guess, and a real
+    declaration still wins.
+    """
+
+    monkeypatch.setattr(
+        vlm_model.model_config,
+        "get_vlm_max_inline_bytes",
+        lambda: 1024 * 1024,
+    )
+    clip = tmp_path / "media-blob"
+    clip.write_bytes(b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 64)
+
+    def inline(media_type: str) -> str:
+        part = {
+            "type": "video_url",
+            "video_url": {"url": clip.as_uri(), "mediaType": media_type},
+        }
+        transported, uses_temp_oss = _transport(
+            part,
+            "gpt-vision",
+            "https://api.openai.example/v1",
+        )
+        assert uses_temp_oss is False
+        return str(transported["video_url"]["url"]).split(";", maxsplit=1)[0]
+
+    assert inline("application/octet-stream") == "data:video/mp4"
+    assert inline("") == "data:video/mp4"
+    assert inline("video/quicktime") == "data:video/quicktime"
+
+    still_image = tmp_path / "frame-blob"
+    Image.new("RGB", (8, 8), color="blue").save(still_image, format="PNG")
+    part = {
+        "type": "image_url",
+        "image_url": {
+            "url": still_image.as_uri(),
+            "mediaType": "application/octet-stream",
+        },
+    }
+    transported, _ = _transport(
+        part,
+        "gpt-vision",
+        "https://api.openai.example/v1",
+    )
+    assert str(transported["image_url"]["url"]).startswith(
+        "data:image/png;base64,",
     )
 
 
