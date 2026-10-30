@@ -5,13 +5,17 @@ import asyncio
 import base64
 import hashlib
 import io
+import ipaddress
 import mimetypes
 import re
+import socket
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import quote, urlparse
+from typing import Any, Callable
+from urllib.parse import quote, urlparse, urlunsplit
 
 import httpx
 from PIL import Image
@@ -473,6 +477,149 @@ def _platform_media_upload_cache_key(
     return identity, _credential_cache_token(api_key)
 
 
+@dataclass(frozen=True, slots=True)
+class _PinnedDestination:
+    """One upload target whose address was validated before it was used.
+
+    ``url`` carries a literal address, so the socket cannot be re-resolved to
+    something the policy never saw after the check already ran;
+    ``host_header`` and ``sni_hostname`` keep the configured endpoint's own
+    name in the request and in the TLS handshake, so binding the address
+    changes nothing the provider can observe.
+    """
+
+    url: str
+    host_header: str
+    sni_hostname: str
+    addresses: tuple[str, ...]
+
+
+def _addressed_url(upload_url: str, address: str) -> str:
+    """Rewrite *upload_url*'s authority to the literal *address*."""
+    parsed = urlparse(upload_url)
+    port = parsed.port or (443 if parsed.scheme.casefold() == "https" else 80)
+    host = f"[{address}]" if ":" in address else address
+    return urlunsplit(
+        (
+            parsed.scheme,
+            f"{host}:{port}",
+            parsed.path or "/",
+            parsed.query,
+            "",
+        ),
+    )
+
+
+def _pin_destination(
+    upload_url: str,
+    destination_guard: Callable[[str], None],
+) -> _PinnedDestination:
+    """Resolve *upload_url* and bind it to an address the guard accepts.
+
+    A guard that judges strings can only ever judge a hostname as a
+    hostname, while what decides whether a request reaches a metadata service
+    is the address the resolver hands back. Every answer is therefore handed
+    to the same policy as a literal-address URL — one rule covering the
+    configured base, the DNS answer and the connected peer — and the request
+    is rewritten to a validated literal so no re-resolution can overrule it.
+    A name that resolves to nothing is refused rather than guessed at.
+    """
+    parsed = urlparse(upload_url)
+    host = (parsed.hostname or "").strip()
+    if not host:
+        raise RuntimeError(
+            f"provider media upload has no host to bind: {upload_url!r}",
+        )
+    try:
+        ipaddress.ip_address(host.split("%", 1)[0])
+    except ValueError:
+        pass
+    else:
+        # Nothing to resolve: the guard judged this literal already. A scoped
+        # IPv6 zone names the interface the operator chose, while the socket
+        # reports the bare address, so both spellings are the same peer.
+        scope_free = host.split("%", 1)[0]
+        accepted = (host,) if scope_free == host else (host, scope_free)
+        return _PinnedDestination(upload_url, "", "", accepted)
+    port = parsed.port or (443 if parsed.scheme.casefold() == "https" else 80)
+    try:
+        records = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except OSError as exc:
+        raise RuntimeError(
+            f"provider media upload cannot resolve {host}: {exc}",
+        ) from exc
+    addresses: list[str] = []
+    for record in records:
+        address = str((record[4] or ("",))[0]).split("%", 1)[0]
+        if address and address not in addresses:
+            addresses.append(address)
+    if not addresses:
+        raise RuntimeError(
+            f"provider media upload cannot resolve {host}: no address",
+        )
+    for address in addresses:
+        destination_guard(_addressed_url(upload_url, address))
+    return _PinnedDestination(
+        url=_addressed_url(upload_url, addresses[0]),
+        # The name as configured, minus any credentials a base URL might carry:
+        # a Host header must name the server, and nothing else.
+        host_header=parsed.netloc.rsplit("@", 1)[-1],
+        sni_hostname=(host if parsed.scheme.casefold() == "https" else ""),
+        addresses=tuple(addresses),
+    )
+
+
+def _assert_pinned_peer(
+    response: Any,
+    pin: _PinnedDestination,
+    destination_guard: Callable[[str], None],
+) -> None:
+    """Re-check the address the socket actually connected to.
+
+    The pin is what makes the pre-flight answer authoritative, but a transport
+    that ignored it — or a proxy standing in between — still has to be
+    caught, so the peer is read once per guarded upload and judged by the
+    same policy. A transport exposing no network stream (a test double, an
+    in-process app) has no address to check and is left to the pin.
+    """
+    extensions = getattr(response, "extensions", None)
+    if not isinstance(extensions, dict):
+        return
+    stream = extensions.get("network_stream")
+    get_extra_info = getattr(stream, "get_extra_info", None)
+    if get_extra_info is None:
+        return
+    peer = get_extra_info("server_addr")
+    if not isinstance(peer, tuple) or not peer:
+        return
+    address = str(peer[0]).split("%", 1)[0]
+    if not address:
+        return
+    destination_guard(_addressed_url(pin.url, address))
+    if address not in pin.addresses:
+        raise RuntimeError(
+            "provider media upload connected to "
+            f"{address}, which its configured host {pin.host_header} was not "
+            "resolved to; the payload was not sent further",
+        )
+
+
+def _upload_target_label(url: str, pin: _PinnedDestination | None) -> str:
+    """Name an upload target the way its operator configured it.
+
+    Binding the address puts a literal in the URL, which says nothing to
+    whoever set the base URL and would leak one resolution into the message
+    the UI shows. The configured authority is the useful label, and the path
+    is unchanged by the pin.
+    """
+    if pin is None or not pin.host_header:
+        return url
+    parsed = urlparse(url)
+    return urlunsplit(
+        (parsed.scheme, pin.host_header, parsed.path, parsed.query, ""),
+    )
+
+
 def _post_platform_media_upload(
     client: httpx.Client,
     *,
@@ -481,24 +628,52 @@ def _post_platform_media_upload(
     filename: str,
     file_source: object,
     media_type: str,
+    refuse_redirects: bool = False,
+    pin: _PinnedDestination | None = None,
+    destination_guard: Callable[[str], None] | None = None,
 ) -> str:
     """Upload one payload through the proxy. Returns its public URL."""
-    url = platform_media_upload_url(base_url)
+    url = pin.url if pin is not None else platform_media_upload_url(base_url)
+    headers = {"Authorization": f"Bearer {api_key}"}
+    bound: dict[str, Any] = {}
+    if pin is not None:
+        # The URL names a validated literal, so the endpoint still has to be
+        # addressed by its own host and seen with its own certificate:
+        # binding the address must not change what the provider is told.
+        if pin.host_header:
+            headers["Host"] = pin.host_header
+        if pin.sni_hostname:
+            bound["extensions"] = {"sni_hostname": pin.sni_hostname}
     response = client.post(
         url,
-        headers={"Authorization": f"Bearer {api_key}"},
+        headers=headers,
         files={"file": (filename, file_source, media_type)},
+        **bound,
     )
+    if pin is not None and destination_guard is not None:
+        _assert_pinned_peer(response, pin, destination_guard)
+    if refuse_redirects and 300 <= response.status_code < 400:
+        # A redirect would carry this payload, and the bearer naming it, to a
+        # host nobody configured. Only a caller that asked for the strict
+        # policy gets a refusal; production keeps following its own proxy.
+        raise RuntimeError(
+            "provider media upload was redirected (HTTP "
+            f"{response.status_code} -> "
+            f"{response.headers.get('location', '')}); this caller does not "
+            "follow uploads off the configured endpoint",
+        )
     if response.status_code >= 400:
         raise RuntimeError(
             "provider media upload failed "
-            f"(HTTP {response.status_code} {url}): {response.text[:300]}",
+            f"(HTTP {response.status_code} {_upload_target_label(url, pin)})"
+            f": {response.text[:300]}",
         )
     try:
         payload = response.json()
     except ValueError as exc:
         raise RuntimeError(
-            f"provider media upload returned a non-JSON body from {url}",
+            f"provider media upload returned a non-JSON body from "
+            f"{_upload_target_label(url, pin)}",
         ) from exc
     items = payload.get("items") if isinstance(payload, dict) else None
     first = items[0] if isinstance(items, list) and items else None
@@ -521,6 +696,7 @@ def _upload_file_to_platform_media_sync(
     api_key: str,
     base_url: str,
     media_type: str,
+    destination_guard: Callable[[str], None] | None = None,
 ) -> str:
     """Stream one local file to the proxy's own media bucket."""
     size = path.stat().st_size
@@ -532,7 +708,17 @@ def _upload_file_to_platform_media_sync(
         )
     timeout = httpx.Timeout(connect=30.0, read=120.0, write=300.0, pool=30.0)
     filename = _dashscope_transport_filename(path, media_type)
-    with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+    upload_url = platform_media_upload_url(base_url)
+    pin = None
+    if destination_guard is not None:
+        # Checked before the connection is opened, so a refused target never
+        # sees the bearer token at all rather than failing afterwards.
+        destination_guard(upload_url)
+        pin = _pin_destination(upload_url, destination_guard)
+    with httpx.Client(
+        timeout=timeout,
+        follow_redirects=destination_guard is None,
+    ) as client:
         with path.open("rb") as file_handle:
             return _post_platform_media_upload(
                 client,
@@ -541,6 +727,9 @@ def _upload_file_to_platform_media_sync(
                 filename=filename,
                 file_source=file_handle,
                 media_type=media_type,
+                refuse_redirects=destination_guard is not None,
+                pin=pin,
+                destination_guard=destination_guard,
             )
 
 
@@ -551,6 +740,7 @@ def _upload_bytes_to_platform_media_sync(
     api_key: str,
     base_url: str,
     media_type: str,
+    destination_guard: Callable[[str], None] | None = None,
 ) -> str:
     if len(content) > PLATFORM_MEDIA_UPLOAD_MAX_BYTES:
         raise RuntimeError(
@@ -558,7 +748,15 @@ def _upload_bytes_to_platform_media_sync(
             f"{PLATFORM_MEDIA_UPLOAD_MAX_BYTES} bytes ({len(content)} given)",
         )
     timeout = httpx.Timeout(connect=30.0, read=120.0, write=300.0, pool=30.0)
-    with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+    upload_url = platform_media_upload_url(base_url)
+    pin = None
+    if destination_guard is not None:
+        destination_guard(upload_url)
+        pin = _pin_destination(upload_url, destination_guard)
+    with httpx.Client(
+        timeout=timeout,
+        follow_redirects=destination_guard is None,
+    ) as client:
         return _post_platform_media_upload(
             client,
             base_url=base_url,
@@ -566,6 +764,9 @@ def _upload_bytes_to_platform_media_sync(
             filename=_safe_filename(filename),
             file_source=content,
             media_type=media_type,
+            refuse_redirects=destination_guard is not None,
+            pin=pin,
+            destination_guard=destination_guard,
         )
 
 
@@ -575,8 +776,19 @@ async def upload_local_file_to_platform_media(
     api_key: str,
     base_url: str,
     media_type: str,
+    destination_guard: Callable[[str], None] | None = None,
 ) -> str:
-    """Upload a local file through the proxy and cache its public URL."""
+    """Upload a local file through the proxy and cache its public URL.
+
+    *destination_guard* is for callers that must not touch an address their
+    own policy forbids. It is applied to the upload target, to every address
+    the resolver returns for it, and to the peer the socket actually used,
+    and the request is then sent to a validated literal address so nothing
+    can be re-resolved after the policy ran; the client also refuses
+    redirects, so a proxy answering 302 cannot move the payload somewhere
+    else. Leaving it unset keeps the production behaviour and the shared
+    cache intact.
+    """
     resolved = path.expanduser().resolve()
     if not resolved.is_file():
         raise FileNotFoundError(
@@ -586,7 +798,10 @@ async def upload_local_file_to_platform_media(
         raise RuntimeError("provider media upload requires an API key")
     stat = resolved.stat()
     cache_key = _platform_media_upload_cache_key(
-        identity=f"{resolved}|{int(stat.st_size)}|{int(stat.st_mtime_ns)}",
+        identity=(
+            f"{resolved}|{int(stat.st_size)}|{int(stat.st_mtime_ns)}"
+            + ("|strict" if destination_guard is not None else "")
+        ),
         api_key=api_key,
     )
     return await _cached_platform_media_upload(
@@ -596,6 +811,7 @@ async def upload_local_file_to_platform_media(
             api_key=api_key,
             base_url=base_url,
             media_type=media_type,
+            destination_guard=destination_guard,
         ),
     )
 
@@ -607,13 +823,20 @@ async def upload_reference_bytes_to_platform_media(
     api_key: str,
     base_url: str,
     media_type: str,
+    destination_guard: Callable[[str], None] | None = None,
 ) -> str:
-    """Upload in-memory reference media through the proxy."""
+    """Upload in-memory reference media through the proxy.
+
+    See ``upload_local_file_to_platform_media`` for *destination_guard*.
+    """
     if not api_key.strip():
         raise RuntimeError("provider media upload requires an API key")
     digest = hashlib.sha256(content).hexdigest()
     cache_key = _platform_media_upload_cache_key(
-        identity=f"sha256:{digest}|{filename}",
+        identity=(
+            f"sha256:{digest}|{filename}"
+            + ("|strict" if destination_guard is not None else "")
+        ),
         api_key=api_key,
     )
     return await _cached_platform_media_upload(
@@ -624,6 +847,7 @@ async def upload_reference_bytes_to_platform_media(
             api_key=api_key,
             base_url=base_url,
             media_type=media_type,
+            destination_guard=destination_guard,
         ),
     )
 
@@ -652,6 +876,29 @@ async def _cached_platform_media_upload(
         return url
 
 
+def reference_transport_needs_upload_key(
+    base_url: str,
+    protocol: str = "",
+) -> bool:
+    """True when the reference transport for *base_url* must present a key.
+
+    Both remote transports need one: the AgentScope proxy's own media upload
+    and the DashScope model-bound temporary OSS. Only the inline Base64
+    fallback is keyless. A caller that guards on the credential has to
+    mirror the routing below, otherwise an uncredentialed request reaches a
+    remote upload and is answered with 401.
+    """
+    # Local import: vlm_model imports this module at module level.
+    from models.vlm_model import uses_dashscope_transport
+
+    if model_config.is_agentscope_gateway(
+        protocol=protocol,
+        base_url=base_url,
+    ):
+        return True
+    return uses_dashscope_transport(base_url, protocol)
+
+
 async def upload_reference_file_for_provider(
     path: Path,
     *,
@@ -660,13 +907,17 @@ async def upload_reference_file_for_provider(
     media_type: str,
     base_url: str,
     protocol: str = "",
+    destination_guard: Callable[[str], None] | None = None,
 ) -> str:
     """Return a URL the configured provider can fetch for one local file.
 
-    Single decision point for the two reference transports, so a call site
+    Single decision point for the three reference transports, so a call site
     never has to know which storage the endpoint behind it accepts: the
     AgentScope proxy has no Bailian upload identity and takes its own public
-    URL, everything else keeps the model-bound ``oss://`` temporary upload.
+    URL, a DashScope endpoint keeps the model-bound ``oss://`` temporary
+    upload, and any other OpenAI-compatible gateway is served the bytes
+    inline, because it can neither fetch a DashScope OSS object nor accept a
+    Bailian upload credential.
     """
     if model_config.is_agentscope_gateway(
         protocol=protocol,
@@ -677,6 +928,23 @@ async def upload_reference_file_for_provider(
             api_key=api_key,
             base_url=base_url,
             media_type=media_type,
+            destination_guard=destination_guard,
+        )
+    if not reference_transport_needs_upload_key(base_url, protocol):
+        from models.vlm_model import (  # local import: see above
+            transport_local_media_url,
+        )
+
+        # Reuse the VLM inline path so the size budget and the downscaling
+        # ladder apply here too; a raw Base64 of a 200MB clip would otherwise
+        # be assembled without limit.
+        return await transport_local_media_url(
+            path,
+            api_key=api_key,
+            model_name=model_name,
+            media_type=media_type,
+            base_url=base_url,
+            protocol=protocol,
         )
     return await upload_local_file_to_dashscope_temp(
         path,
