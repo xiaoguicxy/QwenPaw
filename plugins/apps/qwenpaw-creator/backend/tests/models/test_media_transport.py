@@ -1,5 +1,9 @@
 # -*- coding: utf-8 -*-
 # flake8: noqa: E501
+# The two host predicates are private to their modules on purpose, and these
+# tests call them directly to pin which transport each host is classified
+# into, which is the decision the review asked to see covered.
+# pylint: disable=protected-access
 from __future__ import annotations
 
 import asyncio
