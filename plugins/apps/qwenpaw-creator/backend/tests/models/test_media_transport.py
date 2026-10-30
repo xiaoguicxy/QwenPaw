@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
+import ipaddress
 import socket
 from urllib.parse import urlparse
 
@@ -761,7 +762,29 @@ class _GuardedUploadStream:
         return (self.peer, 443) if key == "server_addr" else None
 
 
-_METADATA_ADDRESSES = {"169.254.169.254", "fe80::ec2:254"}
+_METADATA_ADDRESSES = {"169.254.169.254", "100.100.100.200", "fd00:ec2::254"}
+
+
+def _is_metadata_host(host: str) -> bool:
+    """Judge an address the way the route's policy does, not as a string.
+
+    The transport hands the policy every resolver answer as a literal, and a
+    literal has several spellings: the route refuses an IPv4-mapped IPv6 as
+    the endpoint it names, so a membership test here would hide that. Which
+    spellings the real policy refuses is pinned by
+    ``tests/api/test_model_connection_probe.py``; this double only has to
+    notice what it was given.
+    """
+    try:
+        address = ipaddress.ip_address(host.split("%", 1)[0])
+    except ValueError:
+        return False
+    spellings = (address, getattr(address, "ipv4_mapped", None))
+    return any(
+        spelling is not None
+        and (spelling.is_link_local or str(spelling) in _METADATA_ADDRESSES)
+        for spelling in spellings
+    )
 
 
 def _recording_guard():
@@ -771,7 +794,7 @@ def _recording_guard():
     def guard(url):
         seen.append(url)
         host = urlparse(url).hostname or ""
-        if host in _METADATA_ADDRESSES:
+        if _is_metadata_host(host):
             raise ValueError(f"forbidden address: {host}")
 
     return guard, seen
@@ -799,7 +822,7 @@ def _addressed(upload_url, address):
 
 @pytest.mark.parametrize(
     "address",
-    ["169.254.169.254", "fe80::ec2:254"],
+    ["169.254.169.254", "fe80::ec2:254", "::ffff:100.100.100.200"],
 )
 def test_guarded_upload_refuses_a_name_that_resolves_to_metadata(
     monkeypatch,
