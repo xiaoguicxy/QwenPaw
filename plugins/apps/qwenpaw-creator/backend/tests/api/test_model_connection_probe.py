@@ -1296,3 +1296,111 @@ def test_gemini_vlm_probe_converts_image_to_inline_data() -> None:
     assert len(parts) == 2
     assert parts[0] == {"text": "Reply with red only."}
     assert parts[1]["inline_data"]["mime_type"] == "image/png"
+
+
+@pytest.mark.parametrize(
+    ("body_text", "expected_ok", "expected_verified", "expected_error"),
+    [
+        # An accepted submit that is still queued. The probe posts and
+        # deliberately does not poll, so this is where the evidence stops.
+        (
+            '{"output": {"task_id": "t-1", "task_status": "PENDING"}}',
+            True,
+            False,
+            "",
+        ),
+        # The same submit whose task had already failed, with the provider's
+        # refusal nested inside ``output`` rather than at the top level.
+        (
+            '{"output": {"task_id": "t-1", "task_status": "FAILED", '
+            '"code": "InvalidParameter", '
+            '"message": "Failed to download audio"}}',
+            False,
+            None,
+            "InvalidParameter",
+        ),
+        # A terminal failure the provider left unexplained is still terminal.
+        # ``_error_wrapped_in_2xx`` only reacts to ``code``/``message``, so
+        # this case is what proves the status list itself is consulted.
+        (
+            '{"output": {"task_id": "t-1", "task_status": "FAILED"}}',
+            False,
+            None,
+            "FAILED",
+        ),
+        # A submit that produced no task at all is a refusal, not a mystery.
+        ('{"output": {"task_status": "PENDING"}}', False, None, "task_id"),
+        # A gateway that answers with a finished task may be believed.
+        (
+            '{"output": {"task_id": "t-1", "task_status": "SUCCEEDED"}}',
+            True,
+            True,
+            "",
+        ),
+        # A state this code does not know is not evidence of a breakage.
+        (
+            '{"output": {"task_id": "t-1", "task_status": "HELD"}}',
+            True,
+            False,
+            "",
+        ),
+    ],
+)
+def test_fun_asr_submit_is_graded_on_its_task_state(
+    monkeypatch: pytest.MonkeyPatch,
+    uploaded_samples: list,
+    body_text: str,
+    expected_ok: bool,
+    expected_verified: bool | None,
+    expected_error: str,
+) -> None:
+    """A task id says the queue took the work, not that a transcript exists.
+
+    ``asr_model._fun_asr`` polls until ``task_status`` reaches SUCCEEDED and
+    raises on anything else, so a probe that does not poll may not call a
+    FAILED task a verified capability — and an unlisted state has to leave
+    the verdict at "credential accepted" rather than inventing a failure.
+    """
+
+    del uploaded_samples
+    result = _connection_test_replying(
+        _request(),
+        monkeypatch,
+        body_text,
+    )
+
+    assert result.ok is expected_ok
+    assert result.capability_verified is expected_verified
+    if expected_error:
+        assert expected_error in (result.error or "")
+
+
+def test_asr_probe_refuses_a_metadata_base_without_staging_the_sample(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No network side effect may run ahead of the destination policy.
+
+    Staging the sample is a request of its own that carries the configured
+    bearer, so guarding only ``_send_probe`` handed the key to a hostile base
+    URL and explained the refusal afterwards. The policy has to decide first.
+    """
+
+    async def refuse_upload(path, **kwargs):
+        del path, kwargs
+        raise AssertionError("the probe uploaded before checking its target")
+
+    monkeypatch.setattr(model_routes, "load_model_config", _ProbeConfig)
+    monkeypatch.setattr(
+        media_transport,
+        "upload_local_file_to_dashscope_temp",
+        refuse_upload,
+    )
+
+    result = asyncio.run(
+        model_routes.test_model_connection(
+            _request(base_url="http://169.254.169.254/api/v1"),
+        ),
+    )
+
+    assert result.ok is False
+    assert "元数据" in (result.error or "")

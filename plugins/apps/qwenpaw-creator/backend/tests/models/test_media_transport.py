@@ -311,12 +311,66 @@ def test_dashscope_transport_covers_maas_without_trusting_lookalikes() -> None:
     dashscope_transport_cases = {
         "https://dashscope.aliyuncs.com/compatible-mode/v1": True,
         "https://dashscope-intl.aliyuncs.com/api/v1": True,
-        "https://token-plan.cn-beijing.maas.aliyuncs.com/api/v1": True,
         "https://api.openai.example/v1": False,
         "https://evil.example/.maas.aliyuncs.com": False,
         "https://maas.aliyuncs.com.evil.com/api/v1": False,
         "": False,
     }
     for base_url, expected in dashscope_transport_cases.items():
-        selected = vlm_model._is_dashscope_provider(base_url)
+        selected = vlm_model._is_dashscope_provider(base_url, "DashScope")
         assert selected is expected, base_url
+
+    # A MaaS host proves the wire format, not the upload identity, so the
+    # protocol label has to be able to take the ``oss://`` route back away.
+    maas = "https://ws-1.cn-beijing.maas.aliyuncs.com/api/v1"
+    assert vlm_model._is_dashscope_provider(maas, "DashScope") is True
+    assert vlm_model._is_dashscope_provider(maas, "Aliyun Token Plan") is False
+
+
+def test_token_plan_media_stays_on_the_inline_budget(tmp_path, monkeypatch):
+    """Token Plan credentials must never be offered the Bailian upload API.
+
+    Reproduced from the review: a small PNG under a Token Plan MaaS
+    configuration used to travel inline and reach the model. Treating every
+    ``maas.aliyuncs.com`` host as upload-capable sent it to
+    ``dashscope.aliyuncs.com/api/v1/uploads`` instead, which answers that key
+    401 and turns a working configuration into a ModelError.
+    """
+
+    async def refuse_upload(path, **kwargs):
+        del path, kwargs
+        raise AssertionError("a Token Plan key reached the upload API")
+
+    maas = "https://token-plan.cn-beijing.maas.aliyuncs.com/api/v1"
+    monkeypatch.setattr(
+        vlm_model.model_config,
+        "get_vlm_base_url",
+        lambda: maas,
+    )
+    monkeypatch.setattr(
+        vlm_model.model_config,
+        "get_vlm_protocol",
+        lambda: "Aliyun Token Plan",
+    )
+    monkeypatch.setattr(
+        media_transport,
+        "upload_local_file_to_dashscope_temp",
+        refuse_upload,
+    )
+    monkeypatch.setattr(
+        vlm_model,
+        "upload_local_file_to_dashscope_temp",
+        refuse_upload,
+    )
+    image = tmp_path / "frame.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 64)
+
+    url = asyncio.run(
+        vlm_model.transport_local_media_url(
+            image,
+            api_key="sk-token-plan",
+            model_name="qwen3-vl-plus",
+        ),
+    )
+
+    assert str(url).startswith("data:image/png;base64,")
