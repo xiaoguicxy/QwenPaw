@@ -1874,6 +1874,27 @@ def _operator_written_base_url(section: str) -> str:
     return value
 
 
+def _credential_owner_section(loaded: ModelConfigData, section: str) -> str:
+    """Return the section that really owns the credential ``section`` sends.
+
+    ``_assemble_model_config`` copies values, not provenance: a VLM saved with
+    ``use_llm`` holds the LLM credential in its own fields, and an embedding
+    reusing the VLM key inherits that same credential one step further.
+    Asking whether the borrowing field is non-empty would attribute the key to
+    the borrower - whose Base URL the operator never wrote for it - and refuse
+    the one origin the key genuinely belongs to.
+    """
+    if section == "vlm":
+        return "llm" if loaded.vlm.use_llm else "vlm"
+    if section == "embedding":
+        if loaded.vlm.use_llm or not loaded.vlm.api_key:
+            # A keyless VLM, or one that borrows the LLM itself, never owns
+            # the credential this switch asks to reuse.
+            return "llm"
+        return "vlm"
+    return section
+
+
 def _normalized_origin(base_url: str) -> str:
     """Return the ``scheme://host:port`` HTTPX itself would connect to.
 
@@ -1991,12 +2012,17 @@ def _non_secret_probe_params(
 
     A GET probe sends its payload as URL parameters, and query strings end up
     in provider access logs, intermediaries and browser history.  No builder
-    puts the key in the parameters today; this drops any value that *is* the
-    key so a future builder cannot regress it.
+    puts the key in the parameters today; this drops any value that *carries*
+    the key - bare or wrapped in a scheme such as ``Bearer`` - so a future
+    builder cannot regress it.
     """
     if not api_key:
         return payload
-    return {key: value for key, value in payload.items() if value != api_key}
+    return {
+        key: value
+        for key, value in payload.items()
+        if api_key not in str(value)
+    }
 
 
 async def _prepare_probe_payload(
@@ -2242,15 +2268,23 @@ async def test_model_connection(
         # operator saved next to the reuse switch was authorised by that
         # switch; a default-filled address was not.
         trusted_base_urls.append(_operator_written_base_url("llm"))
+    if body.type == "vlm" and getattr(item, "use_llm", False):
+        # "Reuse the text model" is an explicit decision to send the LLM
+        # credential, and assembly overwrites whatever address the VLM
+        # section still holds, so the VLM's own stale host is not an
+        # authorization either - only the LLM's written origin is.
+        if loaded.llm.api_key:
+            fallback_api_key = loaded.llm.api_key
+            trusted_base_urls = [_operator_written_base_url("llm")]
     if (
         body.type == "embedding"
         and getattr(item, "reuse_vlm_key", False)
         and not fallback_api_key
     ):
-        # Trust the origin of the key that is really selected: when the VLM
-        # holds no key of its own this falls through to the LLM credential,
-        # and the VLM endpoint does not own that one.
-        key_owner = "vlm" if loaded.vlm.api_key else "llm"
+        # Trust the origin of the key that is really selected: a VLM that
+        # borrows the LLM credential cannot be named its owner, and the
+        # embedding's own saved address stays authorised by its switch.
+        key_owner = _credential_owner_section(loaded, "embedding")
         fallback_api_key = getattr(loaded, key_owner).api_key
         trusted_base_urls.append(_operator_written_base_url(key_owner))
     request_api_key = "" if body.api_key == SECRET_MASK else body.api_key
