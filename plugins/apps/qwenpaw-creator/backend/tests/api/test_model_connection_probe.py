@@ -9,6 +9,11 @@ probes it used to rely on (``GET /models/{id}``, the upload-policy call) said
 nothing about transcription, which is how three dead ASR routes stayed green.
 """
 
+# pylint: disable=redefined-outer-name
+# The two fake httpx clients below have to spell their body keyword ``json``
+# because that is the keyword ``_send_probe`` posts with, and this module
+# imports the ``json`` codec to build the canned replies the route grades.
+
 from __future__ import annotations
 
 import asyncio

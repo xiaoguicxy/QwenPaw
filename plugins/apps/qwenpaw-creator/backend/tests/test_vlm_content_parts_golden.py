@@ -42,7 +42,9 @@ def _formatted_media_blocks(parts):
     """
 
     message = Msg(
-        name="user", role="user", content=native_content_blocks(parts)
+        name="user",
+        role="user",
+        content=native_content_blocks(parts),
     )
     outcomes = {}
     for label, formatter in (
@@ -119,7 +121,7 @@ def test_inlined_media_keeps_its_type_through_the_sdk_formatters(
     )
     assert uses_temp_oss is False
     assert str(transported["image_url"]["url"]).startswith(
-        "data:image/png;base64,"
+        "data:image/png;base64,",
     )
 
     text = {"type": "text", "text": "look"}
