@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import types
 
+import httpx
 import pytest
 
 from api.model_routes import (
@@ -507,7 +508,14 @@ def _stub_saved_config(monkeypatch, **sections: dict) -> None:
     def _load_saved():
         return types.SimpleNamespace(**saved)
 
+    def _written(section: str) -> str:
+        raw = sections.get(section, {})
+        return str(raw.get("base_url") or "").strip()
+
     monkeypatch.setattr(model_routes, "load_model_config", _load_saved)
+    # The stub stands in for model_config.json, so whatever a test passes here
+    # counts as written by the operator; built-in defaults stay out of it.
+    monkeypatch.setattr(model_routes, "_operator_written_base_url", _written)
 
 
 def _no_dispatch_client(monkeypatch) -> None:
@@ -897,3 +905,289 @@ def test_get_probe_params_never_carry_the_credential() -> None:
     assert _non_secret_probe_params({"model": "fun-asr"}, "") == {
         "model": "fun-asr",
     }
+
+
+# ---------------------------------------------------------------------------
+# Round-2 review: a built-in default is not an operator authorization.
+#
+# These cases go through the real config assembly (a model_config.json under an
+# isolated data root) and a real HTTPX client over MockTransport. Only that
+# shows ``_defaults()`` at work, and only HTTPX itself can prove which URLs it
+# is willing to build a request for - a stubbed client hid exactly those bugs.
+# ---------------------------------------------------------------------------
+
+_REAL_ENV_KEYS = (
+    "TEXT_API_KEY",
+    "TEXT_BASE_URL",
+    "VLM_API_KEY",
+    "VLM_BASE_URL",
+    "ASR_API_KEY",
+    "ASR_BASE_URL",
+    "DASHSCOPE_API_KEY",
+)
+
+
+def _write_real_config(monkeypatch, tmp_path, config: dict) -> None:
+    """Save ``config`` the way the product does, then let it be assembled."""
+    import json
+
+    from api import model_routes
+
+    data_root = tmp_path / "data-root"
+    (data_root / "config").mkdir(parents=True, exist_ok=True)
+    config_file = data_root / "config" / "model_config.json"
+    config_file.write_text(json.dumps(config), encoding="utf-8")
+    for name in _REAL_ENV_KEYS:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("CREATOR_DATA_ROOT", str(data_root))
+    monkeypatch.setenv("CREATOR_MODEL_CONFIG_PATH", str(config_file))
+    # pylint: disable-next=protected-access
+    model_routes._invalidate_raw_config_cache()
+
+
+def _real_transport_dispatch(monkeypatch) -> list:
+    """Build the request with HTTPX; mock only the socket layer."""
+    from api import model_routes
+
+    sent: list[tuple[str, str]] = []
+
+    def _handle(request: httpx.Request) -> httpx.Response:
+        sent.append(
+            (str(request.url), request.headers.get("authorization", "")),
+        )
+        return httpx.Response(200, json={})
+
+    real_client = httpx.AsyncClient
+
+    def _factory(*args, **kwargs):
+        kwargs.pop("transport", None)
+        return real_client(
+            *args,
+            transport=httpx.MockTransport(_handle),
+            **kwargs,
+        )
+
+    monkeypatch.setattr(model_routes.httpx, "AsyncClient", _factory)
+    return sent
+
+
+def _saved_llm_only(base_url: str = "https://llm.example/v1") -> dict:
+    return {
+        "llm": {
+            "base_url": base_url,
+            "api_key": "sk-review-owner-fake",
+            "model_name": "glm-5",
+            "protocol": "OpenAI Chat",
+        },
+    }
+
+
+@pytest.mark.parametrize("model_type", ["asr", "embedding"])
+def test_builtin_default_target_never_receives_a_foreign_saved_key(
+    monkeypatch,
+    tmp_path,
+    model_type: str,
+) -> None:
+    """Unconfigured sections borrow a DashScope address, not a credential."""
+    from api import model_routes
+
+    _write_real_config(monkeypatch, tmp_path, _saved_llm_only())
+    sent = _real_transport_dispatch(monkeypatch)
+
+    response = asyncio.run(
+        model_routes.test_model_connection(
+            ModelConnectionTestRequest(type=model_type),
+        ),
+    )
+
+    assert not response.ok
+    assert "归属地址不一致" in response.error
+    assert not sent
+
+
+def test_builtin_default_still_probes_when_the_saved_key_owns_that_origin(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """A DashScope key may reach the built-in DashScope endpoint."""
+    from api import model_routes
+
+    _write_real_config(
+        monkeypatch,
+        tmp_path,
+        _saved_llm_only("https://dashscope.aliyuncs.com/compatible-mode/v1"),
+    )
+    sent = _real_transport_dispatch(monkeypatch)
+
+    response = asyncio.run(
+        model_routes.test_model_connection(
+            ModelConnectionTestRequest(type="asr"),
+        ),
+    )
+
+    assert response.ok
+    assert sent and sent[0][0].startswith(
+        "https://dashscope.aliyuncs.com/api/v1/",
+    )
+    assert sent[0][1] == "Bearer sk-review-owner-fake"
+
+
+def test_embedding_falls_back_to_the_origin_that_owns_the_key(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """A keyless VLM host must not inherit trust for the LLM credential."""
+    from api import model_routes
+
+    _write_real_config(
+        monkeypatch,
+        tmp_path,
+        {
+            **_saved_llm_only(),
+            "vlm": {
+                "use_llm": False,
+                "api_key": "",
+                "base_url": "http://127.0.0.1:8765/v1",
+                "model_name": "vl",
+                "protocol": "OpenAI Chat",
+            },
+            "embedding": {
+                "base_url": "https://embedding.example/v1",
+                "api_key": "",
+                "reuse_vlm_key": True,
+                "model_name": "qwen3-vl-embedding",
+            },
+        },
+    )
+    sent = _real_transport_dispatch(monkeypatch)
+
+    response = asyncio.run(
+        model_routes.test_model_connection(
+            ModelConnectionTestRequest(
+                type="embedding",
+                base_url="http://127.0.0.1:8765/v1",
+                model_name="qwen3-vl-embedding",
+            ),
+        ),
+    )
+
+    assert not response.ok
+    assert "安全限制" in response.error
+    assert not sent
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        # UTS-46 would fold this into example.com; HTTPX refuses it outright.
+        "https://exaｍple.com/v1",
+        "https://example.com/a\tb",
+        "https://256.256.256.256/v1",
+        "https://[::1",
+    ],
+)
+def test_url_httpx_cannot_build_is_a_config_error_not_a_500(
+    monkeypatch,
+    tmp_path,
+    base_url: str,
+) -> None:
+    """The guard decides with HTTPX's own parser, so nothing escapes as 500."""
+    from api import model_routes
+
+    _write_real_config(
+        monkeypatch,
+        tmp_path,
+        _saved_llm_only("https://example.com/v1"),
+    )
+    sent = _real_transport_dispatch(monkeypatch)
+
+    response = asyncio.run(
+        model_routes.test_model_connection(
+            ModelConnectionTestRequest(
+                type="llm",
+                base_url=base_url,
+                model_name="glm-5",
+                protocol="OpenAI Chat",
+                api_key="sk-review-supplied-fake",
+            ),
+        ),
+    )
+
+    assert not response.ok
+    assert "配置不完整" in response.error
+    assert not sent
+
+
+def test_invalid_url_raised_while_building_stays_a_structured_failure(
+    monkeypatch,
+) -> None:
+    """httpx.InvalidURL is not an HTTPError, so the handler has to name it."""
+    from api import model_routes
+
+    _stub_saved_config(
+        monkeypatch,
+        llm={"base_url": "https://llm.example/v1", "api_key": "sk-saved"},
+    )
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc_info):
+            return False
+
+        async def post(self, url, headers=None, json=None):
+            raise httpx.InvalidURL("rejected while building the request")
+
+        async def get(self, url, headers=None, params=None):
+            raise httpx.InvalidURL("rejected while building the request")
+
+    monkeypatch.setattr(
+        model_routes.httpx,
+        "AsyncClient",
+        lambda *args, **kwargs: _Client(),
+    )
+
+    response = asyncio.run(
+        model_routes.test_model_connection(
+            ModelConnectionTestRequest(
+                type="llm",
+                base_url="https://llm.example/v1",
+                model_name="glm-5",
+                protocol="OpenAI Chat",
+            ),
+        ),
+    )
+
+    assert not response.ok
+    assert "InvalidURL" in response.error
+
+
+def test_an_unconfigured_llm_address_is_not_an_authorization_either(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """The reuse branch reads the LLM origin, so it obeys the same rule.
+
+    ``_defaults()`` pre-fills the LLM address too, and a key that arrives from
+    the environment lands on a section nobody configured. Trusting the loaded
+    LLM origin there would let ``{"type": "asr"}`` steer that key to the
+    built-in ASR endpoint, which shares the default origin with it - the leak
+    already closed for the section's own default address, reached through the
+    reuse switch instead.
+    """
+    from api import model_routes
+
+    _write_real_config(monkeypatch, tmp_path, {})
+    monkeypatch.setenv("TEXT_API_KEY", "sk-review-env-fake")
+    sent = _real_transport_dispatch(monkeypatch)
+
+    response = asyncio.run(
+        model_routes.test_model_connection(
+            ModelConnectionTestRequest(type="asr"),
+        ),
+    )
+
+    assert not response.ok
+    assert "归属地址" in response.error
+    assert not sent
