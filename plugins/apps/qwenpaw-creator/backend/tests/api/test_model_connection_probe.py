@@ -21,6 +21,7 @@ import io
 import json
 import wave
 
+import httpx
 import pytest
 
 from api import model_routes
@@ -1461,3 +1462,298 @@ def test_platform_asr_probe_stages_its_sample_the_way_production_does(
     )
     assert sent["payload"]["model"] == "qwen-audio-3.0-asr-flash"
     assert sent["payload"]["_attests"] == "asr-qwen3"
+
+
+@pytest.mark.parametrize(
+    ("body_text", "expected_ok", "expected_verified", "expected_error"),
+    [
+        # An accepted submit that is still queued. The probe posts and
+        # deliberately does not poll, so this is where the evidence stops.
+        (
+            '{"output": {"task_id": "t-1", "task_status": "PENDING"}}',
+            True,
+            False,
+            "",
+        ),
+        # The same submit whose task had already failed, with the provider's
+        # refusal nested inside ``output`` rather than at the top level.
+        (
+            '{"output": {"task_id": "t-1", "task_status": "FAILED", '
+            '"code": "InvalidParameter", '
+            '"message": "Failed to download audio"}}',
+            False,
+            None,
+            "InvalidParameter",
+        ),
+        # A terminal failure the provider left unexplained is still terminal.
+        # ``_error_wrapped_in_2xx`` only reacts to ``code``/``message``, so
+        # this case is what proves the status list itself is consulted.
+        (
+            '{"output": {"task_id": "t-1", "task_status": "FAILED"}}',
+            False,
+            None,
+            "FAILED",
+        ),
+        # A submit that produced no task at all is a refusal, not a mystery.
+        ('{"output": {"task_status": "PENDING"}}', False, None, "task_id"),
+        # A gateway that answers with a finished task may be believed.
+        (
+            '{"output": {"task_id": "t-1", "task_status": "SUCCEEDED"}}',
+            True,
+            True,
+            "",
+        ),
+        # A state this code does not know is not evidence of a breakage.
+        (
+            '{"output": {"task_id": "t-1", "task_status": "HELD"}}',
+            True,
+            False,
+            "",
+        ),
+    ],
+)
+def test_fun_asr_submit_is_graded_on_its_task_state(
+    monkeypatch: pytest.MonkeyPatch,
+    uploaded_samples: list,
+    body_text: str,
+    expected_ok: bool,
+    expected_verified: bool | None,
+    expected_error: str,
+) -> None:
+    """A task id says the queue took the work, not that a transcript exists.
+
+    ``asr_model._fun_asr`` polls until ``task_status`` reaches SUCCEEDED and
+    raises on anything else, so a probe that does not poll may not call a
+    FAILED task a verified capability — and an unlisted state has to leave
+    the verdict at "credential accepted" rather than inventing a failure.
+    """
+
+    del uploaded_samples
+    result = _connection_test_replying(
+        _request(),
+        monkeypatch,
+        body_text,
+    )
+
+    assert result.ok is expected_ok
+    assert result.capability_verified is expected_verified
+    if expected_error:
+        assert expected_error in (result.error or "")
+
+
+def test_asr_probe_refuses_a_metadata_base_without_staging_the_sample(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No network side effect may run ahead of the destination policy.
+
+    Staging the sample is a request of its own that carries the configured
+    bearer, so guarding only ``_send_probe`` handed the key to a hostile base
+    URL and explained the refusal afterwards. The policy has to decide first.
+    """
+
+    async def refuse_upload(path, **kwargs):
+        del path, kwargs
+        raise AssertionError("the probe uploaded before checking its target")
+
+    monkeypatch.setattr(model_routes, "load_model_config", _ProbeConfig)
+    monkeypatch.setattr(
+        media_transport,
+        "upload_local_file_to_dashscope_temp",
+        refuse_upload,
+    )
+
+    result = asyncio.run(
+        model_routes.test_model_connection(
+            _request(base_url="http://169.254.169.254/api/v1"),
+        ),
+    )
+
+    assert result.ok is False
+    assert "元数据" in (result.error or "")
+
+
+@pytest.mark.parametrize(
+    ("saved_protocol", "draft_protocol", "expected_path"),
+    [
+        # The dialog was switched to the platform and not saved yet: the
+        # proxy serves this route under ``/v1``, while the saved token-portal
+        # label points at an ``/api/v1`` path the platform never deploys.
+        (
+            "DashScope Fun-ASR",
+            "AgentScope Platform",
+            "/v1/services/aigc/multimodal-generation/generation",
+        ),
+        (
+            "AgentScope Platform",
+            "DashScope Fun-ASR",
+            "/api/v1/services/aigc/multimodal-generation/generation",
+        ),
+    ],
+)
+def test_asr_probe_derives_its_route_from_the_draft_protocol(
+    monkeypatch: pytest.MonkeyPatch,
+    saved_protocol: str,
+    draft_protocol: str,
+    expected_path: str,
+) -> None:
+    """A probe tests the configuration in the dialog, not the saved one.
+
+    ``_qwen3_endpoint`` used to read the persisted ASR protocol. On the
+    official platform host the hostname identifies the gateway anyway, which
+    kept the stale read invisible; behind a custom proxy domain the protocol
+    label is the only thing saying which prefix the route lives under, and
+    the probe posted to a path the configuration under test never serves.
+    """
+
+    async def fake_platform_upload(path, **kwargs):
+        del path, kwargs
+        return "https://gateway.invalid/media/creator-probe.wav"
+
+    monkeypatch.setattr(
+        model_routes.model_config,
+        "get_asr_protocol",
+        lambda: saved_protocol,
+    )
+    monkeypatch.setattr(
+        media_transport,
+        "upload_local_file_to_platform_media",
+        fake_platform_upload,
+    )
+
+    url, _headers, payload = _probe(
+        _request(
+            base_url="https://gateway.invalid/v1",
+            model_name="qwen-audio-3.0-asr-flash",
+            protocol=draft_protocol,
+        ),
+    )
+
+    assert url.endswith(expected_path)
+    assert payload["_attests"] == "asr-qwen3"
+
+
+def test_platform_probe_upload_refuses_a_redirect_off_the_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The sample upload obeys the redirect policy the probe request uses.
+
+    Production follows redirects because the proxy is the operator's own. A
+    probe carrying the configured bearer may not be moved to a host nobody
+    named, so it asks for the strict client and reports the move instead of
+    quietly testing somewhere else.
+    """
+
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        return httpx.Response(
+            302,
+            headers={"location": "http://169.254.169.254/latest/meta-data/"},
+        )
+
+    real_client = httpx.Client
+
+    def client_factory(*args, **kwargs):
+        kwargs.pop("transport", None)
+        return real_client(
+            *args,
+            transport=httpx.MockTransport(handler),
+            **kwargs,
+        )
+
+    async def refuse_send(client, url, headers, payload):
+        del client, url, headers, payload
+        raise AssertionError("the model request ran after a refused redirect")
+
+    monkeypatch.setattr(media_transport.httpx, "Client", client_factory)
+    monkeypatch.setattr(model_routes, "load_model_config", _ProbeConfig)
+    monkeypatch.setattr(model_routes, "_send_probe", refuse_send)
+
+    result = asyncio.run(
+        model_routes.test_model_connection(
+            _request(
+                base_url="https://gateway.invalid/v1",
+                model_name="qwen-audio-3.0-asr-flash",
+                protocol="AgentScope Platform",
+            ),
+        ),
+    )
+
+    assert result.ok is False
+    # One request only: the 302 was never followed to the metadata service.
+    assert seen == ["https://gateway.invalid/v1/media/uploads"]
+    assert "redirected" in (result.error or "")
+
+
+def test_platform_probe_upload_carries_the_destination_guard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The metadata address is refused before the upload, not after it.
+
+    The upload target is derived from the same base URL as the model request,
+    so it used to reach the address the policy forbids with the bearer
+    attached and still report a refusal at the end. Nothing may leave.
+    """
+
+    def forbid(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("a probe upload client was opened")
+
+    async def refuse_send(client, url, headers, payload):
+        del client, url, headers, payload
+        raise AssertionError("the model request ran after a refused target")
+
+    monkeypatch.setattr(media_transport.httpx, "Client", forbid)
+    monkeypatch.setattr(model_routes, "load_model_config", _ProbeConfig)
+    monkeypatch.setattr(model_routes, "_send_probe", refuse_send)
+
+    result = asyncio.run(
+        model_routes.test_model_connection(
+            _request(
+                base_url="http://169.254.169.254/v1",
+                model_name="qwen-audio-3.0-asr-flash",
+                protocol="AgentScope Platform",
+            ),
+        ),
+    )
+
+    assert result.ok is False
+    assert "元数据" in (result.error or "")
+
+
+def test_a_platform_probe_refusal_never_stages_the_sample(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No network side effect may run ahead of the destination policy.
+
+    The platform upload carries a guard of its own, which is what kept the
+    route-level ordering untested: swapping the two statements in the probe
+    still refused, just one request later. The first line of defence has to be
+    the probe itself, so this stub replaces the upload entirely and any call to
+    it is a failure regardless of what the real client would have checked.
+    """
+
+    async def refuse_upload(path, **kwargs):
+        del path, kwargs
+        raise AssertionError("the probe uploaded before checking its target")
+
+    monkeypatch.setattr(model_routes, "load_model_config", _ProbeConfig)
+    monkeypatch.setattr(
+        media_transport,
+        "upload_local_file_to_platform_media",
+        refuse_upload,
+    )
+
+    result = asyncio.run(
+        model_routes.test_model_connection(
+            _request(
+                base_url="http://169.254.169.254/v1",
+                model_name="qwen-audio-3.0-asr-flash",
+                protocol="AgentScope Platform",
+            ),
+        ),
+    )
+
+    assert result.ok is False
+    assert "元数据" in (result.error or "")

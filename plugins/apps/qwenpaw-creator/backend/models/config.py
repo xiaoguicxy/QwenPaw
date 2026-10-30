@@ -779,6 +779,21 @@ def is_maas_endpoint(base_url: str) -> bool:
     return hostname == _MAAS_HOST or hostname.endswith(f".{_MAAS_HOST}")
 
 
+def is_token_plan_protocol(protocol: str) -> bool:
+    """True when *protocol* names the Aliyun Token Plan credential surface.
+
+    Token Plan speaks the DashScope wire format on a ``maas.aliyuncs.com``
+    host, so neither the host nor the API shape separates it from a Bailian
+    deployment. Its key, though, is refused by the model-bound temporary
+    upload API (``GET /api/v1/uploads?action=getPolicy`` answers 401), which
+    is exactly why media bound for it has to stay on the inline Base64
+    budget. Several call sites decide on that difference, so the label match
+    lives here once instead of being spelled out per module.
+    """
+    lowered = (protocol or "").casefold()
+    return "token plan" in lowered or "tokenplan" in lowered
+
+
 AGENTSCOPE_PLATFORM_HOST = "agentscope.io"
 
 
@@ -1905,7 +1920,7 @@ def video_backend_for_protocol(protocol: str) -> str | None:
     # the video protocol (see ``is_agentscope_gateway``).
     if "agentscope" in lowered:
         return "wan"
-    if "token plan" in lowered or "tokenplan" in lowered:
+    if is_token_plan_protocol(protocol):
         return "wan"
     if "dashscope" in lowered or "百炼" in protocol:
         return "wan"

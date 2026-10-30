@@ -632,3 +632,31 @@ def test_anthropic_caller_rejects_video_before_io_or_http(
         )
 
     assert caught.value.retryable is False
+
+
+def test_image_bytes_settle_a_label_the_file_name_gets_wrong(tmp_path):
+    """A suffix can be wrong in the other direction, and the bytes decide.
+
+    Whatever ``_mime_for_path`` returns ends up in the data URL header that
+    ``native_content`` reads, so a converter that wrote a GIF under a ``.png``
+    suffix used to cost the block its real type — and the review's counter-
+    case showed a confirmed declaration losing to a wrong-but-specific
+    extension. Sniffing the payload settles both.
+    """
+
+    gif = tmp_path / "sticker.png"
+    gif.write_bytes(b"GIF89a" + b"\x00" * 24)
+    assert vlm_model._mime_for_path(gif, "image/png") == "image/gif"
+
+    png = tmp_path / "frame.jpg"
+    png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 24)
+    assert vlm_model._mime_for_path(png, "") == "image/png"
+
+    webp = tmp_path / "icon.png"
+    webp.write_bytes(b"RIFF\x00\x00\x00\x00WEBPVP8 ")
+    assert vlm_model._mime_for_path(webp, "image/png") == "image/webp"
+
+    # Video is not sniffed, so the suffix still answers for it.
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 8)
+    assert vlm_model._mime_for_path(clip, "image/png") == "video/mp4"

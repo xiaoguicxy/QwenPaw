@@ -72,18 +72,54 @@ IMAGE_INLINE_LADDER = (
 # caller already confirmed.
 _GENERIC_MIME = "application/octet-stream"
 
+# The image families Creator inlines, keyed by the signature their bytes
+# actually carry.  A label taken from a file name can be wrong in either
+# direction — a converter that writes PNG under a ``.jpg`` suffix, or a real
+# PNG stored as ``reference-4821.bin`` — and only the bytes settle it.
+_IMAGE_SIGNATURES: tuple[tuple[bytes, str], ...] = (
+    (b"\x89PNG\r\n\x1a\n", "image/png"),
+    (b"\xff\xd8\xff", "image/jpeg"),
+    (b"GIF87a", "image/gif"),
+    (b"GIF89a", "image/gif"),
+    (b"BM", "image/bmp"),
+)
+
+
+def _sniff_image_mime(head: bytes) -> str:
+    """Return the image type *head* starts with, or ``""`` for anything else.
+
+    Only images are sniffed.  Video containers keep their brand at an offset
+    behind a size field, and the suffix resolves them well enough that
+    guessing here would risk trading a wrong subtype for a worse one.
+    """
+    for signature, mime in _IMAGE_SIGNATURES:
+        if head.startswith(signature):
+            return mime
+    if head.startswith(b"RIFF") and head[8:12] == b"WEBP":
+        return "image/webp"
+    return ""
+
 
 def _mime_for_path(path: Path, declared: str) -> str:
     """Return the media type to label *path* with.
 
-    The extension is consulted only when it knows something: a real ``.jpg``
-    still beats a generic declared family, but ``.bin`` ->
+    The bytes decide when they identify an image; otherwise the extension is
+    consulted only when it knows something — a real ``.jpg`` still beats a
+    generic declared family, but ``.bin`` ->
     ``application/octet-stream`` must not outrank a confirmed ``image/png``,
     because the data URL header is what survives to the provider —
     ``native_content._data_block`` reads the media type off the URL, and the
     AgentScope formatters drop a block whose type they do not recognise.  A
     wrong subtype costs a re-decode; the placeholder costs the whole image.
     """
+    try:
+        with path.open("rb") as handle:
+            head = handle.read(16)
+    except OSError:
+        head = b""
+    sniffed = _sniff_image_mime(head)
+    if sniffed:
+        return sniffed
     guessed = mimetypes.guess_type(path.name)[0]
     if not guessed or guessed == _GENERIC_MIME:
         return declared or _GENERIC_MIME
@@ -302,23 +338,39 @@ def _is_media_related_error(text: str) -> bool:
     return any(phrase in text_lower for phrase in _MEDIA_REJECT_PHRASES)
 
 
-def _is_dashscope_provider(base_url: str) -> bool:
+def _is_dashscope_provider(base_url: str, protocol: str = "") -> bool:
     host = urlparse(base_url).hostname or ""
+    if "dashscope" in host:
+        return True
     # A MaaS deployment serves the same API but never spells ``dashscope`` in
     # its host; classifying it as a generic gateway would drop local media to
-    # the inline Base64 budget instead of the 1GB temporary OSS upload.
-    return "dashscope" in host or model_config.is_maas_endpoint(base_url)
+    # the inline Base64 budget instead of the 1GB temporary OSS upload. The
+    # host, though, only proves the wire format — the upload is a separate
+    # credential: a Token Plan key is refused by the Bailian upload API, see
+    # ``video_model._resolve_reference_media_url``, so a MaaS endpoint earns
+    # the ``oss://`` route only when it is not being reached as Token Plan.
+    if not model_config.is_maas_endpoint(base_url):
+        return False
+    return not model_config.is_token_plan_protocol(
+        protocol or model_config.get_vlm_protocol(),
+    )
 
 
-def uses_dashscope_transport(base_url: str = "") -> bool:
+def uses_dashscope_transport(base_url: str = "", protocol: str = "") -> bool:
     """True when local media travels through the DashScope model-bound
     temporary OSS upload (48h TTL, <=1GB) instead of inline Base64 URLs.
 
     *base_url* names the endpoint the caller is about to upload for and
     defaults to the configured VLM. Passing it stops this predicate from
-    disagreeing with the transport the caller actually chose.
+    disagreeing with the transport the caller actually chose. *protocol*
+    names the credential in use the same way: pass it whenever *base_url*
+    comes from a section other than the VLM, because the upload identity is
+    a property of the key, not of the host.
     """
-    return _is_dashscope_provider(base_url or model_config.get_vlm_base_url())
+    return _is_dashscope_provider(
+        base_url or model_config.get_vlm_base_url(),
+        protocol,
+    )
 
 
 async def transport_local_media_url(
@@ -328,6 +380,7 @@ async def transport_local_media_url(
     model_name: str,
     media_type: str = "",
     base_url: str = "",
+    protocol: str = "",
 ) -> str:
     """Return a URL for *local_path* that the configured VLM can ingest.
 
@@ -344,7 +397,7 @@ async def transport_local_media_url(
         if local_path.suffix.lower() in VIDEO_SUFFIXES
         else "image/png"
     )
-    if uses_dashscope_transport(base_url):
+    if uses_dashscope_transport(base_url, protocol):
         return await upload_local_file_to_dashscope_temp(
             local_path,
             api_key=api_key,

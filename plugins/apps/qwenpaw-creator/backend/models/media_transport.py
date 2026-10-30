@@ -11,6 +11,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 from urllib.parse import quote, urlparse
 
 import httpx
@@ -481,6 +482,7 @@ def _post_platform_media_upload(
     filename: str,
     file_source: object,
     media_type: str,
+    refuse_redirects: bool = False,
 ) -> str:
     """Upload one payload through the proxy. Returns its public URL."""
     url = platform_media_upload_url(base_url)
@@ -489,6 +491,16 @@ def _post_platform_media_upload(
         headers={"Authorization": f"Bearer {api_key}"},
         files={"file": (filename, file_source, media_type)},
     )
+    if refuse_redirects and 300 <= response.status_code < 400:
+        # A redirect would carry this payload, and the bearer naming it, to a
+        # host nobody configured. Only a caller that asked for the strict
+        # policy gets a refusal; production keeps following its own proxy.
+        raise RuntimeError(
+            "provider media upload was redirected (HTTP "
+            f"{response.status_code} -> "
+            f"{response.headers.get('location', '')}); this caller does not "
+            "follow uploads off the configured endpoint",
+        )
     if response.status_code >= 400:
         raise RuntimeError(
             "provider media upload failed "
@@ -521,6 +533,7 @@ def _upload_file_to_platform_media_sync(
     api_key: str,
     base_url: str,
     media_type: str,
+    destination_guard: Callable[[str], None] | None = None,
 ) -> str:
     """Stream one local file to the proxy's own media bucket."""
     size = path.stat().st_size
@@ -532,7 +545,15 @@ def _upload_file_to_platform_media_sync(
         )
     timeout = httpx.Timeout(connect=30.0, read=120.0, write=300.0, pool=30.0)
     filename = _dashscope_transport_filename(path, media_type)
-    with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+    upload_url = platform_media_upload_url(base_url)
+    if destination_guard is not None:
+        # Checked before the connection is opened, so a refused target never
+        # sees the bearer token at all rather than failing afterwards.
+        destination_guard(upload_url)
+    with httpx.Client(
+        timeout=timeout,
+        follow_redirects=destination_guard is None,
+    ) as client:
         with path.open("rb") as file_handle:
             return _post_platform_media_upload(
                 client,
@@ -541,6 +562,7 @@ def _upload_file_to_platform_media_sync(
                 filename=filename,
                 file_source=file_handle,
                 media_type=media_type,
+                refuse_redirects=destination_guard is not None,
             )
 
 
@@ -551,6 +573,7 @@ def _upload_bytes_to_platform_media_sync(
     api_key: str,
     base_url: str,
     media_type: str,
+    destination_guard: Callable[[str], None] | None = None,
 ) -> str:
     if len(content) > PLATFORM_MEDIA_UPLOAD_MAX_BYTES:
         raise RuntimeError(
@@ -558,7 +581,13 @@ def _upload_bytes_to_platform_media_sync(
             f"{PLATFORM_MEDIA_UPLOAD_MAX_BYTES} bytes ({len(content)} given)",
         )
     timeout = httpx.Timeout(connect=30.0, read=120.0, write=300.0, pool=30.0)
-    with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+    upload_url = platform_media_upload_url(base_url)
+    if destination_guard is not None:
+        destination_guard(upload_url)
+    with httpx.Client(
+        timeout=timeout,
+        follow_redirects=destination_guard is None,
+    ) as client:
         return _post_platform_media_upload(
             client,
             base_url=base_url,
@@ -566,6 +595,7 @@ def _upload_bytes_to_platform_media_sync(
             filename=_safe_filename(filename),
             file_source=content,
             media_type=media_type,
+            refuse_redirects=destination_guard is not None,
         )
 
 
@@ -575,8 +605,16 @@ async def upload_local_file_to_platform_media(
     api_key: str,
     base_url: str,
     media_type: str,
+    destination_guard: Callable[[str], None] | None = None,
 ) -> str:
-    """Upload a local file through the proxy and cache its public URL."""
+    """Upload a local file through the proxy and cache its public URL.
+
+    *destination_guard* is for callers that must not touch an address their
+    own policy forbids: it is applied to the upload target before the
+    connection opens and switches the client to refusing redirects, so a
+    proxy that answers 302 does not move the payload somewhere else. Leaving
+    it unset keeps the production behaviour and the shared cache intact.
+    """
     resolved = path.expanduser().resolve()
     if not resolved.is_file():
         raise FileNotFoundError(
@@ -586,7 +624,10 @@ async def upload_local_file_to_platform_media(
         raise RuntimeError("provider media upload requires an API key")
     stat = resolved.stat()
     cache_key = _platform_media_upload_cache_key(
-        identity=f"{resolved}|{int(stat.st_size)}|{int(stat.st_mtime_ns)}",
+        identity=(
+            f"{resolved}|{int(stat.st_size)}|{int(stat.st_mtime_ns)}"
+            + ("|strict" if destination_guard is not None else "")
+        ),
         api_key=api_key,
     )
     return await _cached_platform_media_upload(
@@ -596,6 +637,7 @@ async def upload_local_file_to_platform_media(
             api_key=api_key,
             base_url=base_url,
             media_type=media_type,
+            destination_guard=destination_guard,
         ),
     )
 
@@ -607,13 +649,20 @@ async def upload_reference_bytes_to_platform_media(
     api_key: str,
     base_url: str,
     media_type: str,
+    destination_guard: Callable[[str], None] | None = None,
 ) -> str:
-    """Upload in-memory reference media through the proxy."""
+    """Upload in-memory reference media through the proxy.
+
+    See ``upload_local_file_to_platform_media`` for *destination_guard*.
+    """
     if not api_key.strip():
         raise RuntimeError("provider media upload requires an API key")
     digest = hashlib.sha256(content).hexdigest()
     cache_key = _platform_media_upload_cache_key(
-        identity=f"sha256:{digest}|{filename}",
+        identity=(
+            f"sha256:{digest}|{filename}"
+            + ("|strict" if destination_guard is not None else "")
+        ),
         api_key=api_key,
     )
     return await _cached_platform_media_upload(
@@ -624,6 +673,7 @@ async def upload_reference_bytes_to_platform_media(
             api_key=api_key,
             base_url=base_url,
             media_type=media_type,
+            destination_guard=destination_guard,
         ),
     )
 
@@ -672,7 +722,7 @@ def reference_transport_needs_upload_key(
         base_url=base_url,
     ):
         return True
-    return uses_dashscope_transport(base_url)
+    return uses_dashscope_transport(base_url, protocol)
 
 
 async def upload_reference_file_for_provider(
@@ -683,6 +733,7 @@ async def upload_reference_file_for_provider(
     media_type: str,
     base_url: str,
     protocol: str = "",
+    destination_guard: Callable[[str], None] | None = None,
 ) -> str:
     """Return a URL the configured provider can fetch for one local file.
 
@@ -703,6 +754,7 @@ async def upload_reference_file_for_provider(
             api_key=api_key,
             base_url=base_url,
             media_type=media_type,
+            destination_guard=destination_guard,
         )
     if not reference_transport_needs_upload_key(base_url, protocol):
         from models.vlm_model import (  # local import: see above
@@ -718,6 +770,7 @@ async def upload_reference_file_for_provider(
             model_name=model_name,
             media_type=media_type,
             base_url=base_url,
+            protocol=protocol,
         )
     return await upload_local_file_to_dashscope_temp(
         path,

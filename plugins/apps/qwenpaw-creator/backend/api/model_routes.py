@@ -1934,6 +1934,11 @@ async def _upload_asr_probe_sample(
             media_type="audio/wav",
             base_url=body.base_url,
             protocol=body.protocol,
+            # The upload is a network side effect of the probe and carries
+            # the same bearer, so it obeys the same destination policy as the
+            # request it is staging for, instead of reaching a host that the
+            # probe itself would refuse.
+            destination_guard=_assert_probe_destination,
         )
 
 
@@ -1984,10 +1989,23 @@ async def _asr_probe(
                 },
             },
         )
+    # Staging the sample is a network side effect of its own: it posts the
+    # configured bearer to the endpoint derived from this same base URL. So
+    # the destination policy runs on the route being tested BEFORE the first
+    # packet leaves, not only inside ``_send_probe`` — a Base URL that points
+    # at the metadata service has to fail without uploading anything.
+    if provider == "qwen3-asr":
+        url = _qwen3_endpoint(body.base_url, protocol=body.protocol)
+    else:
+        url = (
+            f"{_fun_asr_base(body.base_url)}"
+            f"/{_FUN_ASR_TRANSCRIPTION_SUFFIX}"
+        )
+    _assert_probe_destination(url)
     file_url = await _upload_asr_probe_sample(body)
     if provider == "qwen3-asr":
         return (
-            _qwen3_endpoint(body.base_url),
+            url,
             {**headers, "X-DashScope-OssResourceResolve": "enable"},
             {
                 "_attests": _ATTEST_ASR_QWEN3,
@@ -2007,12 +2025,10 @@ async def _asr_probe(
     # omitting X-DashScope-Async is what made an earlier attempt at this
     # probe come back 403 "does not support asynchronous calls". The probe
     # deliberately does not poll the task, because a UI button needs bounded
-    # latency, so what it asserts is that the transcription route exists,
-    # accepts the key and takes the work. A worker that dies mid-task is
-    # still invisible here.
-    fun_base = _fun_asr_base(body.base_url)
+    # latency, so what it can assert is that the transcription route exists,
+    # accepts the key and took the work — not that a transcript will appear.
     return (
-        f"{fun_base}/{_FUN_ASR_TRANSCRIPTION_SUFFIX}",
+        url,
         {
             **headers,
             "X-DashScope-Async": "enable",
@@ -2184,23 +2200,66 @@ _ATTEST_ASR_FUN = "asr-fun"
 _ASR_SUCCESS_FIELDS: dict[str, tuple[tuple[str, ...], bool]] = {
     _ATTEST_ASR_WHISPER: (("text",), True),
     _ATTEST_ASR_QWEN3: (("output",), False),
-    _ATTEST_ASR_FUN: (("output", "task_id"), False),
 }
+
+# Fun-ASR is the one async route and gets its own grading below: a 2xx submit
+# only says a task was taken, while ``asr_model._fun_asr`` polls until
+# ``task_status`` is ``SUCCEEDED`` and refuses anything else.  A task id on
+# its own cannot be promoted to "transcription works".
+_ASR_TASK_SUCCEEDED = "SUCCEEDED"
+# Only a state known to be terminal-and-negative is a refusal. Anything else
+# the provider invented stays a credential-only verdict: guessing at an
+# unlisted status would report a working route as broken.
+_ASR_TASK_FAILED = ("FAILED", "CANCEL", "CANCELED", "CANCELLED")
+
+
+def _grade_fun_asr_submit(document: Mapping[str, Any]) -> tuple[bool, str]:
+    """Grade an asynchronous submit, which cannot have proved a transcript.
+
+    The probe posts and deliberately does not poll, so the only positive
+    claim available is that the route accepted the work.  A submit that came
+    back with a terminal failure is refused outright, and one that is still
+    queued leaves ``capability_verified`` false: the test button reports a
+    credential and an accepted task, not a transcription.
+    """
+    output = document.get("output")
+    if not isinstance(output, Mapping):
+        return False, ""
+    if not output.get("task_id"):
+        return False, "转写任务未被受理（异步提交未返回 task_id）"
+    outcome = str(output.get("task_status") or "").strip().upper()
+    if outcome == _ASR_TASK_SUCCEEDED:
+        return True, ""
+    if outcome in _ASR_TASK_FAILED:
+        detail = str(output.get("message") or output.get("code") or "")
+        return (
+            False,
+            f"转写任务以 {outcome} 结束" + (f"：{detail}" if detail else ""),
+        )
+    return False, ""
 
 
 def _error_wrapped_in_2xx(document: Mapping[str, Any]) -> str:
     """Return the provider's own wording when a 2xx body is an error.
 
     Some gateways answer 200 and put the refusal in the body, which is why a
-    status code alone cannot attest to a capability.
+    status code alone cannot attest to a capability.  DashScope nests the same
+    pair inside ``output`` on its asynchronous routes, so one level down is
+    read as well — an accepted submit carrying a failed task is a refusal, not
+    an unfamiliar shape.
     """
-    error = document.get("error")
-    if isinstance(error, Mapping):
-        return str(error.get("message") or error.get("type") or error)
-    if error:
-        return str(error)
-    if document.get("code") and document.get("message"):
-        return f"{document['code']}: {document['message']}"
+    nodes: list[Mapping[str, Any]] = [document]
+    nested = document.get("output")
+    if isinstance(nested, Mapping):
+        nodes.append(nested)
+    for node in nodes:
+        error = node.get("error")
+        if isinstance(error, Mapping):
+            return str(error.get("message") or error.get("type") or error)
+        if error:
+            return str(error)
+        if node.get("code") and node.get("message"):
+            return f"{node['code']}: {node['message']}"
     return ""
 
 
@@ -2233,7 +2292,7 @@ def _grade_attestation(
     """
     if not attests:
         return False, ""
-    if attests not in _ASR_SUCCESS_FIELDS:
+    if attests not in _ASR_SUCCESS_FIELDS and attests != _ATTEST_ASR_FUN:
         return True, ""
     content_type = (response.headers.get("content-type") or "").casefold()
     if "text/html" in content_type:
@@ -2249,6 +2308,8 @@ def _grade_attestation(
     wrapped = _error_wrapped_in_2xx(document)
     if wrapped:
         return False, f"转写探测在 2xx 响应中返回错误：{wrapped}"
+    if attests == _ATTEST_ASR_FUN:
+        return _grade_fun_asr_submit(document)
     path, allow_empty = _ASR_SUCCESS_FIELDS[attests]
     if _carries_field(document, path, allow_empty):
         return True, ""

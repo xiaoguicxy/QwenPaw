@@ -175,7 +175,7 @@ def image_backend_for_protocol(protocol: str) -> str | None:
     p = protocol.casefold()
     if "dashscope" in p or "百炼" in p:
         return "DASHSCOPE"
-    if "token plan" in p or "tokenplan" in p:
+    if model_config.is_token_plan_protocol(p):
         return "DASHSCOPE"
     if "agentscope" in p:
         # Same multimodal-generation wire format; only the reference-media
