@@ -131,7 +131,9 @@ describe("AgentDock composer render path", () => {
       }),
     );
 
-    expect(renderCounter.markdown).toBeGreaterThan(baseline);
+    // Only the appended reply is parsed: the two rebuilt history rows stay
+    // memoized, so the render count grows by exactly one.
+    expect(renderCounter.markdown).toBe(baseline + 1);
   });
 
   it("keeps an unsent draft across a fold and reopen", async () => {
